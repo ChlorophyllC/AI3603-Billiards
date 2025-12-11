@@ -327,18 +327,606 @@ class BasicAgent(Agent):
             return self._random_action()
 
 class NewAgent(Agent):
-    """自定义 Agent 模板（待学生实现）"""
+    """
+    Optimized two-layer decision architecture agent for billiards.
+    Layer 1: Strategy - select best target ball
+    Layer 2: Tactics - geometric calculation or optimization search
+    """
     
     def __init__(self):
-        pass
+        super().__init__()
+        self.BALL_RADIUS = 0.028575
+        
+        # Optimizer configuration
+        self.LIGHT_SEARCH_INIT = 5
+        self.LIGHT_SEARCH_ITER = 5
+
+        self.noise_std = {
+            'V0': 0.1,
+            'phi': 0.1,
+            'theta': 0.1,
+            'a': 0.003,
+            'b': 0.003
+        }
+        self.enable_noise = True
+        
+        print("[NewAgent] Optimized agent initialized with improved reward function")
+    
+    # ==================== Utility Functions ====================
+    def _safe_action(self):
+        """Return a neutral action (no movement)"""
+        return {'V0': 0, 'phi': 0, 'theta': 0, 'a': 0, 'b': 0}
+
+    def _calc_dist(self, pos1, pos2):
+        """Calculate Euclidean distance between two positions"""
+        return np.linalg.norm(np.array(pos1[:2]) - np.array(pos2[:2]))
+    
+    def _unit_vector(self, vec):
+        """Convert vector to unit direction"""
+        vec = np.array(vec[:2])
+        norm = np.linalg.norm(vec)
+        return np.array([1.0, 0.0]) if norm < 1e-6 else vec / norm
+    
+    def _direction_to_degrees(self, direction_vec):
+        """Convert direction vector to angle (0-360 degrees)"""
+        phi = np.arctan2(direction_vec[1], direction_vec[0]) * 180 / np.pi
+        return phi % 360
+    
+    # ==================== Reward Functions ====================
+    
+    def _improved_reward_function(self, shot, last_state, player_targets, table):
+        """
+        Enhanced reward function with dense reward signals.
+        Evaluates: ball pocketing, fouls, and proximity to pockets.
+        """
+        # Detect newly pocketed balls
+        new_pocketed = [bid for bid, b in shot.balls.items() 
+                        if b.state.s == 4 and last_state[bid].state.s != 4]
+        
+        own_pocketed = [bid for bid in new_pocketed if bid in player_targets]
+        enemy_pocketed = [bid for bid in new_pocketed 
+                          if bid not in player_targets and bid not in ["cue", "8"]]
+        
+        cue_pocketed = "cue" in new_pocketed
+        eight_pocketed = "8" in new_pocketed
+
+        # Analyze first contact ball
+        first_contact_ball_id = None
+        foul_first_hit = False
+        
+        for e in shot.events:
+            et = str(e.event_type).lower()
+            ids = list(e.ids) if hasattr(e, 'ids') else []
+            if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
+                other_ids = [i for i in ids if i != 'cue']
+                if other_ids:
+                    first_contact_ball_id = other_ids[0]
+                    break
+        
+        # Check for foul: no first contact
+        if first_contact_ball_id is None:
+            foul_first_hit = len(last_state) > 2
+        else:
+            # Check for illegal first contact
+            remaining_own = [bid for bid in player_targets if last_state[bid].state.s != 4]
+            opponent_plus_eight = [bid for bid in last_state.keys() 
+                                   if bid not in player_targets and bid != 'cue']
+            if '8' not in opponent_plus_eight:
+                opponent_plus_eight.append('8')
+            
+            if remaining_own and first_contact_ball_id in opponent_plus_eight:
+                foul_first_hit = True
+        
+        # Analyze cushion contact
+        cue_hit_cushion = False
+        target_hit_cushion = False
+        foul_no_rail = False
+        
+        for e in shot.events:
+            et = str(e.event_type).lower()
+            ids = list(e.ids) if hasattr(e, 'ids') else []
+            if 'cushion' in et:
+                cue_hit_cushion = cue_hit_cushion or ('cue' in ids)
+                target_hit_cushion = (target_hit_cushion or 
+                                     (first_contact_ball_id and first_contact_ball_id in ids))
+
+        # Check for foul: no rail contact
+        if (not new_pocketed and first_contact_ball_id is not None and 
+            not cue_hit_cushion and not target_hit_cushion):
+            foul_no_rail = True
+        
+        # Calculate base score
+        score = 0
+        
+        # Cue and eight ball penalties
+        if cue_pocketed and eight_pocketed:
+            is_targeting_eight_legally = (len(player_targets) == 1 and 
+                                         player_targets[0] == "8")
+            score += 200 if is_targeting_eight_legally else -500
+        elif cue_pocketed:
+            score -= 20  # Minor penalty, game continues
+        elif eight_pocketed:
+            is_targeting_eight_legally = (len(player_targets) == 1 and 
+                                         player_targets[0] == "8")
+            score += 200 if is_targeting_eight_legally else -500
+        
+        # Foul penalties
+        score -= 30 if foul_first_hit else 0
+        score -= 30 if foul_no_rail else 0
+        
+        # Pocketing rewards
+        score += len(own_pocketed) * 50
+        score -= len(enemy_pocketed) * 20
+        
+        # Default reward for no-event shots
+        if (score == 0 and not cue_pocketed and not eight_pocketed and 
+            not foul_first_hit and not foul_no_rail):
+            score = 10
+        
+        # ============ Dense Reward Signals ============
+        
+        is_targeting_eight_legally = (len(player_targets) == 1 and 
+                                     player_targets[0] == "8")
+        
+        # Distance penalties for eight ball (avoid accidental pocketing)
+        if (not is_targeting_eight_legally and '8' in shot.balls and 
+            shot.balls['8'].state.s != 4):
+            eight_pos = shot.balls['8'].state.rvw[0]
+            eight_dist = self._distance_to_nearest_pocket(eight_pos, table)
+            
+            if eight_dist < 0.3:
+                score -= 100 * (0.3 - eight_dist) / 0.3
+            elif eight_dist > 0.3:
+                score += min(20, (eight_dist - 0.3) * 30)
+        
+        # Distance penalties for cue ball (avoid scratching)
+        if not cue_pocketed and 'cue' in shot.balls:
+            cue_pos = shot.balls['cue'].state.rvw[0]
+            cue_dist = self._distance_to_nearest_pocket(cue_pos, table)
+            
+            if cue_dist < 0.1:
+                score -= 30 * (0.1 - cue_dist) / 0.1
+            elif cue_dist > 0.2:
+                score += min(15, cue_dist * 20)
+        
+        # Combined risk: eight ball and cue ball near same pocket
+        if (not is_targeting_eight_legally and not cue_pocketed and '8' in shot.balls and 
+            shot.balls['8'].state.s != 4):
+            cue_pos = shot.balls['cue'].state.rvw[0]
+            eight_pos = shot.balls['8'].state.rvw[0]
+            
+            for pocket in table.pockets.values():
+                pocket_pos = pocket.center
+                cue_to_pocket = self._calc_dist(cue_pos, pocket_pos)
+                eight_to_pocket = self._calc_dist(eight_pos, pocket_pos)
+                
+                if cue_to_pocket < 0.2 and eight_to_pocket < 0.2:
+                    score -= 50
+                    break
+        
+        return score
+    
+    def _safe_position_reward_function(self, shot, last_state, table, balls):
+        """
+        Reward function for safe action: move cue ball away from danger zones.
+        Rewards: cue far from pockets, black eight far from pockets (if not targeting it).
+        """
+        score = 0
+        
+        if 'cue' not in shot.balls or shot.balls['cue'].state.s == 4:
+            return -500  # Cue pocketed is catastrophic
+        
+        # Cue ball should be far from all pockets
+        cue_pos = shot.balls['cue'].state.rvw[0]
+        cue_dist_to_pocket = self._distance_to_nearest_pocket(cue_pos, table)
+        
+        if cue_dist_to_pocket > 0.5:
+            score += 100
+        elif cue_dist_to_pocket > 0.3:
+            score += 50
+        else:
+            score -= 50 * (0.3 - cue_dist_to_pocket)
+        
+        # Black eight should be far from all pockets (unless targeting it)
+        if '8' in shot.balls and shot.balls['8'].state.s != 4:
+            eight_pos = shot.balls['8'].state.rvw[0]
+            eight_dist_to_pocket = self._distance_to_nearest_pocket(eight_pos, table)
+            
+            if eight_dist_to_pocket > 0.5:
+                score += 80
+            elif eight_dist_to_pocket > 0.3:
+                score += 40
+            else:
+                score -= 100 * (0.3 - eight_dist_to_pocket)
+        
+        # No movement is acceptable
+        if score == 0:
+            score = 5
+        
+        return score
+    
+    def _distance_to_nearest_pocket(self, ball_pos, table):
+        """Calculate distance from ball to nearest pocket"""
+        min_dist = float('inf')
+        for pocket in table.pockets.values():
+            pocket_pos = pocket.center
+            dist = np.linalg.norm(np.array(ball_pos[:2]) - np.array(pocket_pos[:2]))
+            min_dist = min(min_dist, dist)
+        return min_dist
+    
+    # ==================== Geometric Calculation ====================
+    
+    def _calc_ghost_ball(self, target_pos, pocket_pos):
+        """Calculate ghost ball position for aiming"""
+        direction = self._unit_vector(np.array(pocket_pos[:2]) - np.array(target_pos[:2]))
+        ghost_pos = np.array(target_pos[:2]) - direction * (2 * self.BALL_RADIUS)
+        return ghost_pos
+    
+    def _geo_shot(self, cue_pos, target_pos, pocket_pos):
+        """Calculate shot parameters using geometry"""
+        ghost_pos = self._calc_ghost_ball(target_pos, pocket_pos)
+        cue_to_ghost = ghost_pos - np.array(cue_pos[:2])
+        direction = self._unit_vector(cue_to_ghost)
+        phi = self._direction_to_degrees(direction)
+        
+        dist = self._calc_dist(cue_pos, ghost_pos)
+        if dist < 0.3:
+            V0 = 2.0
+        elif dist < 0.8:
+            V0 = 3.0 + dist * 1.5
+        else:
+            V0 = 5.0 + dist * 0.8
+        V0 = min(V0, 7.5)
+        
+        return {
+            'V0': float(V0),
+            'phi': float(phi),
+            'theta': 0.0,
+            'a': 0.0,
+            'b': 0.0
+        }
+    
+    def _calculate_cut_angle(self, cue_pos, target_pos, pocket_pos):
+        """Calculate the cut angle between cue and target"""
+        ghost_pos = self._calc_ghost_ball(target_pos, pocket_pos)
+        vec1 = self._unit_vector(np.array(ghost_pos) - np.array(cue_pos[:2]))
+        vec2 = self._unit_vector(np.array(pocket_pos[:2]) - np.array(target_pos[:2]))
+        dot = np.clip(np.dot(vec1, vec2), -1.0, 1.0)
+        angle = np.arccos(dot) * 180 / np.pi
+        return angle
+    
+    # ==================== Target Ball Selection ====================
+    
+    def _count_obstructions(self, balls, from_pos, to_pos, exclude_ids=['cue']):
+        """Count balls blocking the path between two positions"""
+        count = 0
+        line_vec = np.array(to_pos[:2]) - np.array(from_pos[:2])
+        line_length = np.linalg.norm(line_vec)
+        
+        if line_length < 1e-6:
+            return 0
+        
+        line_dir = line_vec / line_length
+        
+        for bid, ball in balls.items():
+            if bid in exclude_ids or ball.state.s == 4:
+                continue
+            
+            ball_pos = ball.state.rvw[0][:2]
+            vec_to_ball = ball_pos - np.array(from_pos[:2])
+            proj_length = np.dot(vec_to_ball, line_dir)
+            
+            if proj_length < 0 or proj_length > line_length:
+                continue
+            
+            proj_point = np.array(from_pos[:2]) + line_dir * proj_length
+            dist_to_line = np.linalg.norm(ball_pos - proj_point)
+            
+            if dist_to_line < self.BALL_RADIUS * 2.5:
+                count += 1
+        
+        return count
+    
+    def _evaluate_pocket_angle(self, target_pos, pocket_pos):
+        """Score pocket alignment (closer = better)"""
+        dist = self._calc_dist(target_pos, pocket_pos)
+        return 1.0 / (1.0 + dist)
+    
+    def _choose_top_targets(self, balls, my_targets, table, num_choices=3):
+        """
+        Select top N target-pocket combinations.
+        For black eight: select top 5 choices
+        For regular balls: select top 3 choices
+        """
+        all_choices = []
+        cue_pos = balls['cue'].state.rvw[0]
+        black_8_pos = balls['8'].state.rvw[0]
+        
+        for target_id in my_targets:
+            if balls[target_id].state.s == 4:
+                continue
+            
+            target_pos = balls[target_id].state.rvw[0]
+            
+            for pocket_id, pocket in table.pockets.items():
+                pocket_pos = pocket.center
+                score = 0
+                
+                # Distance factor
+                dist_cue_to_target = self._calc_dist(cue_pos, target_pos)
+                score += 50 / (1 + dist_cue_to_target)
+                
+                # Pocket angle quality
+                angle_quality = self._evaluate_pocket_angle(target_pos, pocket_pos)
+                score += angle_quality * 60
+                
+                # Cut angle (closer to 0 is better)
+                cut_angle = self._calculate_cut_angle(cue_pos, target_pos, pocket_pos)
+                score += (90 - cut_angle) / 90 * 40
+                
+                # Obstruction penalties
+                obstruction1 = self._count_obstructions(balls, cue_pos, target_pos, 
+                                                        exclude_ids=['cue', target_id])
+                score -= obstruction1 * 25
+                
+                obstruction2 = self._count_obstructions(balls, target_pos, pocket_pos, 
+                                                        exclude_ids=['cue', target_id])
+                score -= obstruction2 * 30
+                
+                # Black eight safety distance
+                if target_id != '8':
+                    dist_to_black_8 = self._calc_dist(target_pos, black_8_pos)
+                    min_safe_distance = 0.3
+                    if dist_to_black_8 < min_safe_distance:
+                        proximity_penalty = ((min_safe_distance - dist_to_black_8) / 
+                                           min_safe_distance) ** 2 * 200
+                        score -= proximity_penalty
+                
+                all_choices.append((target_id, pocket_id, score))
+        
+        all_choices.sort(key=lambda x: x[2], reverse=True)
+        
+        # For black eight: select top 5, otherwise top 3
+        if my_targets == ['8']:
+            return all_choices[:5]
+        
+        return all_choices[:num_choices]
+    
+    # ==================== Optimization Search ====================
+    
+    def _bayesian_optimized(self, cue_pos, target_pos, pocket_pos, balls, my_targets, table, 
+                           is_black_eight=False):
+        """
+        Optimize shot parameters using Bayesian optimization.
+        
+        Parameters:
+            is_black_eight: if True, use stricter threshold (best_score >= 150)
+        """
+        geo_action = self._geo_shot(cue_pos, target_pos, pocket_pos)
+        
+        pbounds = {
+            'V0': (max(0.5, geo_action['V0'] - 2.0), min(8.0, geo_action['V0'] + 2.0)),
+            'phi': (geo_action['phi'] - 20, geo_action['phi'] + 20),
+            'theta': (0, 15),
+            'a': (-0.3, 0.3),
+            'b': (-0.3, 0.3)
+        }
+        
+        last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        
+        try_times = 3 if not is_black_eight else 5
+        def reward_fn(V0, phi, theta, a, b, trytimes = 3):
+            """Evaluate action through multiple simulation trials"""
+            scores = []
+            try:
+                for _ in range(trytimes):
+                    sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+                    sim_table = copy.deepcopy(table)
+                    cue = pt.Cue(cue_ball_id="cue")
+                    shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                
+                    # Apply noise if enabled
+                    if self.enable_noise:
+                        V0_n = np.clip(V0 + np.random.normal(0, self.noise_std['V0']), 0.5, 8.0)
+                        phi_n = (phi + np.random.normal(0, self.noise_std['phi'])) % 360
+                        theta_n = np.clip(theta + np.random.normal(0, self.noise_std['theta']), 0, 90)
+                        a_n = np.clip(a + np.random.normal(0, self.noise_std['a']), -0.5, 0.5)
+                        b_n = np.clip(b + np.random.normal(0, self.noise_std['b']), -0.5, 0.5)
+                        shot.cue.set_state(V0=V0_n, phi=phi_n, theta=theta_n, a=a_n, b=b_n)
+                    else:
+                        shot.cue.set_state(V0=V0, phi=phi % 360, theta=theta, a=a, b=b)
+                    
+                    pt.simulate(shot, inplace=True)
+                    scores.append(self._improved_reward_function(shot, last_state_snapshot, 
+                                                                my_targets, sim_table))
+                
+                mean_score = np.mean(scores)
+                std_score = np.std(scores)
+                return mean_score - 0.5 * std_score
+            except:
+                return -999
+        
+        try:
+            optimizer = BayesianOptimization(
+                f=reward_fn,
+                pbounds=pbounds,
+                random_state=np.random.randint(1e6),
+                verbose=0
+            )
+            
+            optimizer.maximize(init_points=self.LIGHT_SEARCH_INIT, 
+                             n_iter=self.LIGHT_SEARCH_ITER)
+            
+            best_params = optimizer.max['params']
+            best_score = optimizer.max['target']
+            
+            # Stricter threshold for black eight
+            threshold = 150 if is_black_eight else 10
+            
+            if best_score > threshold:
+                action = {
+                    'V0': float(best_params['V0']),
+                    'phi': float(best_params['phi'] % 360),
+                    'theta': float(best_params['theta']),
+                    'a': float(best_params['a']),
+                    'b': float(best_params['b'])
+                }
+                print(f"[NewAgent] Optimization complete, score: {best_score:.2f}")
+                return action, best_score
+            else:
+                print(f"[NewAgent] Score {best_score:.2f} below threshold {threshold}, returning safe action")
+                return None, best_score
+        except Exception as e:
+            print(f"[NewAgent] Optimization failed: {e}")
+            return None, -999
+    
+    def _optimize_safe_action(self, balls, table):
+        """
+        Optimize cue ball movement to a safe position.
+        Uses dedicated reward function focused on safety.
+        """
+        pbounds = {
+            'V0': (0.5, 3.0),  # Lower speeds for safety
+            'phi': (0, 360),
+            'theta': (0, 20),  # Gentler angles
+            'a': (-0.2, 0.2),
+            'b': (-0.2, 0.2)
+        }
+        
+        last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        
+        def safe_reward_fn(V0, phi, theta, a, b):
+            """Reward function for safe positioning"""
+            try:
+                sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+                sim_table = copy.deepcopy(table)
+                cue = pt.Cue(cue_ball_id="cue")
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                
+                if self.enable_noise:
+                    V0_n = np.clip(V0 + np.random.normal(0, 0.05), 0.5, 3.0)
+                    phi_n = (phi + np.random.normal(0, 2)) % 360
+                    theta_n = np.clip(theta + np.random.normal(0, 1), 0, 20)
+                    a_n = np.clip(a + np.random.normal(0, 0.01), -0.2, 0.2)
+                    b_n = np.clip(b + np.random.normal(0, 0.01), -0.2, 0.2)
+                    shot.cue.set_state(V0=V0_n, phi=phi_n, theta=theta_n, a=a_n, b=b_n)
+                else:
+                    shot.cue.set_state(V0=V0, phi=phi % 360, theta=theta, a=a, b=b)
+                
+                pt.simulate(shot, inplace=True)
+                return self._safe_position_reward_function(shot, last_state_snapshot, sim_table, balls)
+            except:
+                return -999
+        
+        try:
+            optimizer = BayesianOptimization(
+                f=safe_reward_fn,
+                pbounds=pbounds,
+                random_state=np.random.randint(1e6),
+                verbose=0
+            )
+            
+            optimizer.maximize(init_points=8, n_iter=8)
+            
+            best_params = optimizer.max['params']
+            best_score = optimizer.max['target']
+            
+            if best_score > 0:
+                action = {
+                    'V0': float(best_params['V0']),
+                    'phi': float(best_params['phi'] % 360),
+                    'theta': float(best_params['theta']),
+                    'a': float(best_params['a']),
+                    'b': float(best_params['b'])
+                }
+                print(f"[NewAgent] Safe action optimized, score: {best_score:.2f}")
+                return action
+            else:
+                print("[NewAgent] Safe action optimization failed, using neutral action")
+                return self._safe_action()
+        except Exception as e:
+            print(f"[NewAgent] Safe action optimization error: {e}")
+            return self._safe_action()
+    
+    # ==================== Main Decision Logic ====================
     
     def decision(self, balls=None, my_targets=None, table=None):
-        """决策方法
-        
-        参数：
-            observation: (balls, my_targets, table)
-        
-        返回：
-            dict: {'V0', 'phi', 'theta', 'a', 'b'}
         """
-        return self._random_action()
+        Main decision function: select action based on game state.
+        
+        For black eight: require best_score >= 150 and at least 5 valid choices
+        Otherwise: use normal strategy or fallback to optimized safe action
+        """
+        if not all([balls, my_targets, table]):
+            print("[NewAgent] Incomplete parameters")
+            return self._safe_action()
+        
+        try:
+            # Switch to black eight if all own balls pocketed
+            remaining = [bid for bid in my_targets if balls[bid].state.s != 4]
+            if not remaining:
+                my_targets = ['8']
+                print("[NewAgent] Switching to black eight")
+            
+            is_black_eight = (my_targets == ['8'])
+            
+            # Layer 1: Select best targets
+            num_choices = 5 if is_black_eight else 3
+            top_choices = self._choose_top_targets(balls, my_targets, table, num_choices=num_choices)
+            
+            if not top_choices:
+                print("[NewAgent] No valid targets available, using optimized safe action")
+                return self._optimize_safe_action(balls, table)
+            
+            for target_id, pocket_id, target_score in top_choices:
+                cue_pos = balls['cue'].state.rvw[0]
+                target_pos = balls[target_id].state.rvw[0]
+                pocket_pos = table.pockets[pocket_id].center
+
+                geo_action = self._geo_shot(cue_pos, target_pos, pocket_pos)
+                # quick simulation to check if the geo_action is good enough
+                sim_balls = {bid: copy.copy(ball) for bid, ball in balls.items()}
+                sim_table = table  # reuse
+                cue = pt.Cue(cue_ball_id="cue")
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                shot.cue.set_state(**geo_action)
+                pt.simulate(shot, inplace=True)
+                fast_score = self._improved_reward_function(shot, {bid: copy.deepcopy(ball) for bid, ball in balls.items()}, my_targets, sim_table)
+                if fast_score > 60 and not is_black_eight:
+                    return geo_action
+                if fast_score > 200 and is_black_eight:
+                    return geo_action
+                
+            # Layer 2: Optimize top choices
+            best_action = None
+            best_score = -float('inf')
+            best_idx = 0
+
+            for idx, (target_id, pocket_id, target_score) in enumerate(top_choices):
+                print(f"[NewAgent] Option {idx+1}: {target_id}→{pocket_id} (strategic score:{target_score:.2f})")
+                
+                cue_pos = balls['cue'].state.rvw[0]
+                target_pos = balls[target_id].state.rvw[0]
+                pocket_pos = table.pockets[pocket_id].center
+                
+                action, score = self._bayesian_optimized(cue_pos, target_pos, pocket_pos, 
+                                                      balls, my_targets, table, 
+                                                      is_black_eight=is_black_eight)
+                
+                if action is not None and score > best_score:
+                    best_score = score
+                    best_action = action
+                    best_idx = idx + 1
+            
+            if best_action is None or best_score == -999:
+                print("[NewAgent] All options failed, using optimized safe action")
+                return self._optimize_safe_action(balls, table)
+            
+            print(f"[NewAgent] Selected option {best_idx}, final score: {best_score:.2f}")
+            return best_action
+            
+        except Exception as e:
+            print(f"[NewAgent] Decision failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._optimize_safe_action(balls, table)
