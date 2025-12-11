@@ -338,8 +338,8 @@ class NewAgent(Agent):
         self.BALL_RADIUS = 0.028575
         
         # Optimizer configuration
-        self.LIGHT_SEARCH_INIT = 5
-        self.LIGHT_SEARCH_ITER = 5
+        self.LIGHT_SEARCH_INIT = 10
+        self.LIGHT_SEARCH_ITER = 10
 
         self.noise_std = {
             'V0': 0.1,
@@ -715,37 +715,65 @@ class NewAgent(Agent):
         last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
         
         try_times = 3 if not is_black_eight else 5
-        def reward_fn(V0, phi, theta, a, b, trytimes = 3):
-            """Evaluate action through multiple simulation trials"""
+        
+        def evaluate_action(action, trials):
             scores = []
             try:
-                for _ in range(trytimes):
+                for _ in range(trials):
                     sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
                     sim_table = copy.deepcopy(table)
                     cue = pt.Cue(cue_ball_id="cue")
                     shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
-                
-                    # Apply noise if enabled
+
                     if self.enable_noise:
-                        V0_n = np.clip(V0 + np.random.normal(0, self.noise_std['V0']), 0.5, 8.0)
-                        phi_n = (phi + np.random.normal(0, self.noise_std['phi'])) % 360
-                        theta_n = np.clip(theta + np.random.normal(0, self.noise_std['theta']), 0, 90)
-                        a_n = np.clip(a + np.random.normal(0, self.noise_std['a']), -0.5, 0.5)
-                        b_n = np.clip(b + np.random.normal(0, self.noise_std['b']), -0.5, 0.5)
-                        shot.cue.set_state(V0=V0_n, phi=phi_n, theta=theta_n, a=a_n, b=b_n)
+                        noise = self.noise_std
+                        V0 = np.clip(action['V0'] + np.random.normal(0, noise['V0']), 0.5, 8.0)
+                        phi = (action['phi'] + np.random.normal(0, noise['phi'])) % 360
+                        theta = np.clip(action['theta'] + np.random.normal(0, noise['theta']), 0, 90)
+                        a = np.clip(action['a'] + np.random.normal(0, noise['a']), -0.5, 0.5)
+                        b = np.clip(action['b'] + np.random.normal(0, noise['b']), -0.5, 0.5)
+                        cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
                     else:
-                        shot.cue.set_state(V0=V0, phi=phi % 360, theta=theta, a=a, b=b)
-                    
+                        cue.set_state(**action)
+
                     pt.simulate(shot, inplace=True)
-                    scores.append(self._improved_reward_function(shot, last_state_snapshot, 
-                                                                my_targets, sim_table))
-                
-                mean_score = np.mean(scores)
-                std_score = np.std(scores)
-                return mean_score - 0.5 * std_score
-            except:
+                    scores.append(
+                        self._improved_reward_function(
+                            shot,
+                            {bid: copy.deepcopy(ball) for bid, ball in balls.items()},
+                            my_targets,
+                            sim_table
+                        )
+                    )
+
+                return float(np.mean(scores) - 0.5 * np.std(scores))
+
+            except Exception:
                 return -999
         
+        pre_trials = 5 if is_black_eight else 3
+        geo_score = evaluate_action(geo_action, pre_trials)
+        print(f"[NewAgent] geo_action pre-check score = {geo_score:.2f}")
+
+        geo_threshold = 200 if is_black_eight else 50
+        if geo_score >= geo_threshold:
+            print(f"[NewAgent] geo_action passed {geo_threshold}, skip optimization")
+            return geo_action, geo_score
+
+        pbounds = {
+            'V0': (max(0.5, geo_action['V0'] - 2.0), min(8.0, geo_action['V0'] + 2.0)),
+            'phi': (geo_action['phi'] - 20, geo_action['phi'] + 20),
+            'theta': (0, 15),
+            'a': (-0.3, 0.3),
+            'b': (-0.3, 0.3),
+        }
+
+        def reward_fn(V0, phi, theta, a, b):
+            return evaluate_action(
+                {'V0': V0, 'phi': phi % 360, 'theta': theta, 'a': a, 'b': b},
+                3
+            )
+
         try:
             optimizer = BayesianOptimization(
                 f=reward_fn,
@@ -753,29 +781,30 @@ class NewAgent(Agent):
                 random_state=np.random.randint(1e6),
                 verbose=0
             )
-            
-            optimizer.maximize(init_points=self.LIGHT_SEARCH_INIT, 
-                             n_iter=self.LIGHT_SEARCH_ITER)
-            
-            best_params = optimizer.max['params']
-            best_score = optimizer.max['target']
-            
-            # Stricter threshold for black eight
+
+            optimizer.maximize(
+                init_points=self.LIGHT_SEARCH_INIT,
+                n_iter=self.LIGHT_SEARCH_ITER
+            )
+
+            best = optimizer.max
             threshold = 150 if is_black_eight else 10
-            
-            if best_score > threshold:
-                action = {
-                    'V0': float(best_params['V0']),
-                    'phi': float(best_params['phi'] % 360),
-                    'theta': float(best_params['theta']),
-                    'a': float(best_params['a']),
-                    'b': float(best_params['b'])
+
+            if best['target'] > threshold:
+                params = best['params']
+                final_action = {
+                    'V0': float(params['V0']),
+                    'phi': float(params['phi'] % 360),
+                    'theta': float(params['theta']),
+                    'a': float(params['a']),
+                    'b': float(params['b']),
                 }
-                print(f"[NewAgent] Optimization complete, score: {best_score:.2f}")
-                return action, best_score
-            else:
-                print(f"[NewAgent] Score {best_score:.2f} below threshold {threshold}, returning safe action")
-                return None, best_score
+                print(f"[NewAgent] Optimization complete, score: {best['target']:.2f}")
+                return final_action, best['target']
+
+            print(f"[NewAgent] Optimization score {best['target']:.2f} < {threshold}")
+            return None, best['target']
+
         except Exception as e:
             print(f"[NewAgent] Optimization failed: {e}")
             return None, -999
@@ -877,25 +906,6 @@ class NewAgent(Agent):
             if not top_choices:
                 print("[NewAgent] No valid targets available, using optimized safe action")
                 return self._optimize_safe_action(balls, table)
-            
-            for target_id, pocket_id, target_score in top_choices:
-                cue_pos = balls['cue'].state.rvw[0]
-                target_pos = balls[target_id].state.rvw[0]
-                pocket_pos = table.pockets[pocket_id].center
-
-                geo_action = self._geo_shot(cue_pos, target_pos, pocket_pos)
-                # quick simulation to check if the geo_action is good enough
-                sim_balls = {bid: copy.copy(ball) for bid, ball in balls.items()}
-                sim_table = table  # reuse
-                cue = pt.Cue(cue_ball_id="cue")
-                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
-                shot.cue.set_state(**geo_action)
-                pt.simulate(shot, inplace=True)
-                fast_score = self._improved_reward_function(shot, {bid: copy.deepcopy(ball) for bid, ball in balls.items()}, my_targets, sim_table)
-                if fast_score > 60 and not is_black_eight:
-                    return geo_action
-                if fast_score > 200 and is_black_eight:
-                    return geo_action
                 
             # Layer 2: Optimize top choices
             best_action = None
