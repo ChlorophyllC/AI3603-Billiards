@@ -338,8 +338,8 @@ class NewAgent(Agent):
         self.BALL_RADIUS = 0.028575
         
         # Optimizer configuration
-        self.LIGHT_SEARCH_INIT = 10
-        self.LIGHT_SEARCH_ITER = 10
+        self.LIGHT_SEARCH_INIT = 8
+        self.LIGHT_SEARCH_ITER = 3
 
         self.noise_std = {
             'V0': 0.1,
@@ -693,30 +693,7 @@ class NewAgent(Agent):
         return all_choices[:num_choices]
     
     # ==================== Optimization Search ====================
-    
-    def _bayesian_optimized(self, cue_pos, target_pos, pocket_pos, balls, my_targets, table, 
-                           is_black_eight=False):
-        """
-        Optimize shot parameters using Bayesian optimization.
-        
-        Parameters:
-            is_black_eight: if True, use stricter threshold (best_score >= 150)
-        """
-        geo_action = self._geo_shot(cue_pos, target_pos, pocket_pos)
-        
-        pbounds = {
-            'V0': (max(0.5, geo_action['V0'] - 2.0), min(8.0, geo_action['V0'] + 2.0)),
-            'phi': (geo_action['phi'] - 20, geo_action['phi'] + 20),
-            'theta': (0, 15),
-            'a': (-0.3, 0.3),
-            'b': (-0.3, 0.3)
-        }
-        
-        last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-        
-        try_times = 3 if not is_black_eight else 5
-        
-        def evaluate_action(action, trials):
+    def _evaluate_action(self, action, trials, balls, my_targets, table):
             scores = []
             try:
                 for _ in range(trials):
@@ -750,28 +727,34 @@ class NewAgent(Agent):
 
             except Exception:
                 return -999
+            
+    def _bayesian_optimized(self, geo_action, balls, my_targets, table, 
+                           is_black_eight=False):
+        """
+        Optimize shot parameters using Bayesian optimization.
         
-        pre_trials = 5 if is_black_eight else 3
-        geo_score = evaluate_action(geo_action, pre_trials)
-        print(f"[NewAgent] geo_action pre-check score = {geo_score:.2f}")
-
-        geo_threshold = 200 if is_black_eight else 50
-        if geo_score >= geo_threshold:
-            print(f"[NewAgent] geo_action passed {geo_threshold}, skip optimization")
-            return geo_action, geo_score
-
+        Parameters:
+            is_black_eight: if True, use stricter threshold (best_score >= 150)
+        """
+        
+        
         pbounds = {
             'V0': (max(0.5, geo_action['V0'] - 2.0), min(8.0, geo_action['V0'] + 2.0)),
             'phi': (geo_action['phi'] - 20, geo_action['phi'] + 20),
             'theta': (0, 15),
             'a': (-0.3, 0.3),
-            'b': (-0.3, 0.3),
+            'b': (-0.3, 0.3)
         }
+        
+        last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        
+        try_times = 3 if not is_black_eight else 5
 
         def reward_fn(V0, phi, theta, a, b):
-            return evaluate_action(
+            return self._evaluate_action(
                 {'V0': V0, 'phi': phi % 360, 'theta': theta, 'a': a, 'b': b},
-                3
+                3,
+                balls, my_targets, table
             )
 
         try:
@@ -907,6 +890,25 @@ class NewAgent(Agent):
                 print("[NewAgent] No valid targets available, using optimized safe action")
                 return self._optimize_safe_action(balls, table)
                 
+            best_geo_action = None
+            best_geo_score = None
+            geo_results = []
+            for target_id, pocket_id, target_score in top_choices:
+                pre_trials = 5 if is_black_eight else 3
+                cue_pos = balls['cue'].state.rvw[0]
+                target_pos = balls[target_id].state.rvw[0]
+                pocket_pos = table.pockets[pocket_id].center
+                geo_action = self._geo_shot(cue_pos, target_pos, pocket_pos)
+                geo_score = self._evaluate_action(geo_action, pre_trials, balls, my_targets, table)
+                geo_results.append((geo_action, geo_score))
+
+            geo_threshold = 150 if is_black_eight else 35
+            best_geo_action, best_geo_score = max(geo_results, key=lambda x: x[1])
+            
+            if best_geo_score > geo_threshold:
+                print(f"[NewAgent] geo_action passed {geo_threshold}, skip optimization")
+                return best_geo_action
+                
             # Layer 2: Optimize top choices
             best_action = None
             best_score = -float('inf')
@@ -915,19 +917,24 @@ class NewAgent(Agent):
             for idx, (target_id, pocket_id, target_score) in enumerate(top_choices):
                 print(f"[NewAgent] Option {idx+1}: {target_id}→{pocket_id} (strategic score:{target_score:.2f})")
                 
-                cue_pos = balls['cue'].state.rvw[0]
-                target_pos = balls[target_id].state.rvw[0]
-                pocket_pos = table.pockets[pocket_id].center
-                
-                action, score = self._bayesian_optimized(cue_pos, target_pos, pocket_pos, 
+                geo_action = geo_results[idx][0]
+                action, score = self._bayesian_optimized(geo_action, 
                                                       balls, my_targets, table, 
                                                       is_black_eight=is_black_eight)
                 
-                if action is not None and score > best_score:
-                    best_score = score
-                    best_action = action
-                    best_idx = idx + 1
-            
+                if action is not None:
+                    if score > best_score:
+                        best_score = score
+                        best_action = action
+                        best_idx = idx + 1
+
+                    if best_score >= 60 and not is_black_eight:
+                        print(f"[NewAgent] Option {best_idx} passed threshold 60, skip rest of the optimization")
+                        return best_action
+                    if best_score >= 150 and is_black_eight:
+                        print(f"[NewAgent] Option {best_idx} passed black eight threshold 150, skip rest of the optimization")
+                        return best_action
+                    
             if best_action is None or best_score == -999:
                 print("[NewAgent] All options failed, using optimized safe action")
                 return self._optimize_safe_action(balls, table)
