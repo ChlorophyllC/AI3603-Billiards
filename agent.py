@@ -338,8 +338,8 @@ class NewAgent(Agent):
         self.BALL_RADIUS = 0.028575
         
         # Optimizer configuration
-        self.LIGHT_SEARCH_INIT = 8
-        self.LIGHT_SEARCH_ITER = 3
+        self.LIGHT_SEARCH_INIT = 10
+        self.LIGHT_SEARCH_ITER = 10
 
         self.noise_std = {
             'V0': 0.1,
@@ -407,15 +407,19 @@ class NewAgent(Agent):
         if first_contact_ball_id is None:
             foul_first_hit = len(last_state) > 2
         else:
-            # Check for illegal first contact
-            remaining_own = [bid for bid in player_targets if last_state[bid].state.s != 4]
-            opponent_plus_eight = [bid for bid in last_state.keys() 
-                                   if bid not in player_targets and bid != 'cue']
-            if '8' not in opponent_plus_eight:
-                opponent_plus_eight.append('8')
-            
-            if remaining_own and first_contact_ball_id in opponent_plus_eight:
-                foul_first_hit = True
+            if player_targets == ['8']:
+                # Check for illegal first contact
+                if first_contact_ball_id != '8':
+                    foul_first_hit = True
+            else:
+                remaining_own = [bid for bid in player_targets if last_state[bid].state.s != 4]
+                opponent_plus_eight = [bid for bid in last_state.keys() 
+                                    if bid not in player_targets and bid != 'cue']
+                if '8' not in opponent_plus_eight:
+                    opponent_plus_eight.append('8')
+                
+                if remaining_own and first_contact_ball_id in opponent_plus_eight:
+                    foul_first_hit = True
         
         # Analyze cushion contact
         cue_hit_cushion = False
@@ -444,7 +448,7 @@ class NewAgent(Agent):
                                          player_targets[0] == "8")
             score += 200 if is_targeting_eight_legally else -500
         elif cue_pocketed:
-            score -= 20  # Minor penalty, game continues
+            score -= 30  # Minor penalty, game continues
         elif eight_pocketed:
             is_targeting_eight_legally = (len(player_targets) == 1 and 
                                          player_targets[0] == "8")
@@ -503,45 +507,6 @@ class NewAgent(Agent):
                 if cue_to_pocket < 0.2 and eight_to_pocket < 0.2:
                     score -= 50
                     break
-        
-        return score
-    
-    def _safe_position_reward_function(self, shot, last_state, table, balls):
-        """
-        Reward function for safe action: move cue ball away from danger zones.
-        Rewards: cue far from pockets, black eight far from pockets (if not targeting it).
-        """
-        score = 0
-        
-        if 'cue' not in shot.balls or shot.balls['cue'].state.s == 4:
-            return -500  # Cue pocketed is catastrophic
-        
-        # Cue ball should be far from all pockets
-        cue_pos = shot.balls['cue'].state.rvw[0]
-        cue_dist_to_pocket = self._distance_to_nearest_pocket(cue_pos, table)
-        
-        if cue_dist_to_pocket > 0.5:
-            score += 100
-        elif cue_dist_to_pocket > 0.3:
-            score += 50
-        else:
-            score -= 50 * (0.3 - cue_dist_to_pocket)
-        
-        # Black eight should be far from all pockets (unless targeting it)
-        if '8' in shot.balls and shot.balls['8'].state.s != 4:
-            eight_pos = shot.balls['8'].state.rvw[0]
-            eight_dist_to_pocket = self._distance_to_nearest_pocket(eight_pos, table)
-            
-            if eight_dist_to_pocket > 0.5:
-                score += 80
-            elif eight_dist_to_pocket > 0.3:
-                score += 40
-            else:
-                score -= 100 * (0.3 - eight_dist_to_pocket)
-        
-        # No movement is acceptable
-        if score == 0:
-            score = 5
         
         return score
     
@@ -693,43 +658,55 @@ class NewAgent(Agent):
         return all_choices[:num_choices]
     
     # ==================== Optimization Search ====================
-    def _evaluate_action(self, action, trials, balls, my_targets, table):
-            scores = []
-            try:
-                for _ in range(trials):
-                    sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-                    sim_table = copy.deepcopy(table)
-                    cue = pt.Cue(cue_ball_id="cue")
-                    shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+    def _evaluate_action(self, action, trials, balls, my_targets, table, threshold=20):
+        """
+        Evaluate action with early stopping mechanism.
+        
+        Parameters:
+            threshold: if any single trial score < threshold, return immediately
+                      with current mean - 0.5*std instead of completing all trials
+        """
+        scores = []
+        try:
+            for trial_idx in range(trials):
+                sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+                sim_table = copy.deepcopy(table)
+                cue = pt.Cue(cue_ball_id="cue")
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
 
-                    if self.enable_noise:
-                        noise = self.noise_std
-                        V0 = np.clip(action['V0'] + np.random.normal(0, noise['V0']), 0.5, 8.0)
-                        phi = (action['phi'] + np.random.normal(0, noise['phi'])) % 360
-                        theta = np.clip(action['theta'] + np.random.normal(0, noise['theta']), 0, 90)
-                        a = np.clip(action['a'] + np.random.normal(0, noise['a']), -0.5, 0.5)
-                        b = np.clip(action['b'] + np.random.normal(0, noise['b']), -0.5, 0.5)
-                        cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
-                    else:
-                        cue.set_state(**action)
+                if self.enable_noise:
+                    noise = self.noise_std
+                    V0 = np.clip(action['V0'] + np.random.normal(0, noise['V0']), 0.5, 8.0)
+                    phi = (action['phi'] + np.random.normal(0, noise['phi'])) % 360
+                    theta = np.clip(action['theta'] + np.random.normal(0, noise['theta']), 0, 90)
+                    a = np.clip(action['a'] + np.random.normal(0, noise['a']), -0.5, 0.5)
+                    b = np.clip(action['b'] + np.random.normal(0, noise['b']), -0.5, 0.5)
+                    cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
+                else:
+                    cue.set_state(**action)
 
-                    pt.simulate(shot, inplace=True)
-                    scores.append(
-                        self._improved_reward_function(
-                            shot,
-                            {bid: copy.deepcopy(ball) for bid, ball in balls.items()},
-                            my_targets,
-                            sim_table
-                        )
-                    )
+                pt.simulate(shot, inplace=True)
+                trial_score = self._improved_reward_function(
+                    shot,
+                    {bid: copy.deepcopy(ball) for bid, ball in balls.items()},
+                    my_targets,
+                    sim_table
+                )
+                scores.append(trial_score)
+                
+                # Early stopping: if current trial score below threshold, return immediately
+                if trial_score < threshold:
+                    result = float(np.mean(scores) - 0.5 * np.std(scores))
+                    return result
 
-                return float(np.mean(scores) - 0.5 * np.std(scores))
+            return float(np.mean(scores) - 0.5 * np.std(scores))
 
-            except Exception:
-                return -999
+        except Exception as e:
+            print(f"[NewAgent] Evaluation error: {e}")
+            return -999
             
     def _bayesian_optimized(self, geo_action, balls, my_targets, table, 
-                           is_black_eight=False):
+                           is_black_eight=False, safe_mode=False):
         """
         Optimize shot parameters using Bayesian optimization.
         
@@ -737,15 +714,24 @@ class NewAgent(Agent):
             is_black_eight: if True, use stricter threshold (best_score >= 150)
         """
         
-        
-        pbounds = {
-            'V0': (max(0.5, geo_action['V0'] - 2.0), min(8.0, geo_action['V0'] + 2.0)),
-            'phi': (geo_action['phi'] - 20, geo_action['phi'] + 20),
-            'theta': (0, 15),
-            'a': (-0.3, 0.3),
-            'b': (-0.3, 0.3)
-        }
-        
+        if not safe_mode:
+            pbounds = {
+                'V0': (max(0.5, geo_action['V0'] - 2.0), min(8.0, geo_action['V0'] + 2.0)),
+                'phi': (geo_action['phi'] - 20, geo_action['phi'] + 20),
+                'theta': (0, 15),
+                'a': (-0.3, 0.3),
+                'b': (-0.3, 0.3)
+            }
+            
+        else:
+            pbounds = {
+                'V0': (0.5, 2.0),  # Lower speeds for safety
+                'phi': (0, 360),
+                'theta': (0, 20),  # Gentler angles
+                'a': (-0.2, 0.2),
+                'b': (-0.2, 0.2)
+            }
+
         last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
         
         try_times = 3 if not is_black_eight else 5
@@ -754,7 +740,8 @@ class NewAgent(Agent):
             return self._evaluate_action(
                 {'V0': V0, 'phi': phi % 360, 'theta': theta, 'a': a, 'b': b},
                 3,
-                balls, my_targets, table
+                balls, my_targets, table,
+                threshold=120 if is_black_eight else 10
             )
 
         try:
@@ -771,7 +758,7 @@ class NewAgent(Agent):
             )
 
             best = optimizer.max
-            threshold = 150 if is_black_eight else 10
+            threshold = 20 if not is_black_eight else 150
 
             if best['target'] > threshold:
                 params = best['params']
@@ -792,73 +779,23 @@ class NewAgent(Agent):
             print(f"[NewAgent] Optimization failed: {e}")
             return None, -999
     
-    def _optimize_safe_action(self, balls, table):
+    # ==================== Game State Detection ====================
+    
+    def _detect_opening_state(self, balls):
         """
-        Optimize cue ball movement to a safe position.
-        Uses dedicated reward function focused on safety.
+        Detect if current state is an opening position.
+        Opening state: most colored balls still on table (>= 12 balls)
+        
+        Returns:
+            True if opening state detected, False otherwise
         """
-        pbounds = {
-            'V0': (0.5, 3.0),  # Lower speeds for safety
-            'phi': (0, 360),
-            'theta': (0, 20),  # Gentler angles
-            'a': (-0.2, 0.2),
-            'b': (-0.2, 0.2)
-        }
+        colored_balls = [bid for bid in balls.keys() if bid not in ['cue', '8']]
+        colored_on_table = [bid for bid in colored_balls if balls[bid].state.s != 4]
         
-        last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-        
-        def safe_reward_fn(V0, phi, theta, a, b):
-            """Reward function for safe positioning"""
-            try:
-                sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-                sim_table = copy.deepcopy(table)
-                cue = pt.Cue(cue_ball_id="cue")
-                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
-                
-                if self.enable_noise:
-                    V0_n = np.clip(V0 + np.random.normal(0, 0.05), 0.5, 3.0)
-                    phi_n = (phi + np.random.normal(0, 2)) % 360
-                    theta_n = np.clip(theta + np.random.normal(0, 1), 0, 20)
-                    a_n = np.clip(a + np.random.normal(0, 0.01), -0.2, 0.2)
-                    b_n = np.clip(b + np.random.normal(0, 0.01), -0.2, 0.2)
-                    shot.cue.set_state(V0=V0_n, phi=phi_n, theta=theta_n, a=a_n, b=b_n)
-                else:
-                    shot.cue.set_state(V0=V0, phi=phi % 360, theta=theta, a=a, b=b)
-                
-                pt.simulate(shot, inplace=True)
-                return self._safe_position_reward_function(shot, last_state_snapshot, sim_table, balls)
-            except:
-                return -999
-        
-        try:
-            optimizer = BayesianOptimization(
-                f=safe_reward_fn,
-                pbounds=pbounds,
-                random_state=np.random.randint(1e6),
-                verbose=0
-            )
-            
-            optimizer.maximize(init_points=8, n_iter=8)
-            
-            best_params = optimizer.max['params']
-            best_score = optimizer.max['target']
-            
-            if best_score > 0:
-                action = {
-                    'V0': float(best_params['V0']),
-                    'phi': float(best_params['phi'] % 360),
-                    'theta': float(best_params['theta']),
-                    'a': float(best_params['a']),
-                    'b': float(best_params['b'])
-                }
-                print(f"[NewAgent] Safe action optimized, score: {best_score:.2f}")
-                return action
-            else:
-                print("[NewAgent] Safe action optimization failed, using neutral action")
-                return self._safe_action()
-        except Exception as e:
-            print(f"[NewAgent] Safe action optimization error: {e}")
-            return self._safe_action()
+        is_opening = len(colored_on_table) >= 12
+        if is_opening:
+            print(f"[NewAgent] Opening state detected ({len(colored_on_table)} colored balls on table)")
+        return is_opening
     
     # ==================== Main Decision Logic ====================
     
@@ -873,7 +810,18 @@ class NewAgent(Agent):
             print("[NewAgent] Incomplete parameters")
             return self._safe_action()
         
+        is_opening = False
+        original_light_search_init = self.LIGHT_SEARCH_INIT
+        original_light_search_iter = self.LIGHT_SEARCH_ITER
+        
         try:
+            # Detect opening state and reduce optimization iterations
+            is_opening = self._detect_opening_state(balls)
+            if is_opening:
+                self.LIGHT_SEARCH_INIT = 3
+                self.LIGHT_SEARCH_ITER = 1
+                print(f"[NewAgent] Opening state: reduced search from ({original_light_search_init}, {original_light_search_iter}) to ({self.LIGHT_SEARCH_INIT}, {self.LIGHT_SEARCH_ITER})")
+            
             # Switch to black eight if all own balls pocketed
             remaining = [bid for bid in my_targets if balls[bid].state.s != 4]
             if not remaining:
@@ -888,7 +836,7 @@ class NewAgent(Agent):
             
             if not top_choices:
                 print("[NewAgent] No valid targets available, using optimized safe action")
-                return self._optimize_safe_action(balls, table)
+                return self._safe_action()
                 
             best_geo_action = None
             best_geo_score = None
@@ -899,13 +847,13 @@ class NewAgent(Agent):
                 target_pos = balls[target_id].state.rvw[0]
                 pocket_pos = table.pockets[pocket_id].center
                 geo_action = self._geo_shot(cue_pos, target_pos, pocket_pos)
-                geo_score = self._evaluate_action(geo_action, pre_trials, balls, my_targets, table)
+                geo_score = self._evaluate_action(geo_action, pre_trials, balls, my_targets, table, 20)
                 geo_results.append((geo_action, geo_score))
 
-            geo_threshold = 150 if is_black_eight else 35
+            geo_threshold = 40
             best_geo_action, best_geo_score = max(geo_results, key=lambda x: x[1])
             
-            if best_geo_score > geo_threshold:
+            if not is_black_eight and best_geo_score > geo_threshold:
                 print(f"[NewAgent] geo_action passed {geo_threshold}, skip optimization")
                 return best_geo_action
                 
@@ -928,16 +876,17 @@ class NewAgent(Agent):
                         best_action = action
                         best_idx = idx + 1
 
-                    if best_score >= 60 and not is_black_eight:
+                    if not is_black_eight and best_score >= 60:
                         print(f"[NewAgent] Option {best_idx} passed threshold 60, skip rest of the optimization")
-                        return best_action
-                    if best_score >= 150 and is_black_eight:
-                        print(f"[NewAgent] Option {best_idx} passed black eight threshold 150, skip rest of the optimization")
                         return best_action
                     
             if best_action is None or best_score == -999:
-                print("[NewAgent] All options failed, using optimized safe action")
-                return self._optimize_safe_action(balls, table)
+                print("[NewAgent] All options failed, using safe action")
+                action, score = self._bayesian_optimized(self._safe_action(), 
+                                                      balls, my_targets, table, 
+                                                      is_black_eight=is_black_eight, safe_mode=True)
+                
+                return self._safe_action()
             
             print(f"[NewAgent] Selected option {best_idx}, final score: {best_score:.2f}")
             return best_action
@@ -946,4 +895,11 @@ class NewAgent(Agent):
             print(f"[NewAgent] Decision failed: {e}")
             import traceback
             traceback.print_exc()
-            return self._optimize_safe_action(balls, table)
+            return self._safe_action()
+        
+        finally:
+            # Restore original optimization parameters if opening state was detected
+            if is_opening:
+                self.LIGHT_SEARCH_INIT = original_light_search_init
+                self.LIGHT_SEARCH_ITER = original_light_search_iter
+                print("[NewAgent] Optimization parameters restored")
