@@ -442,6 +442,7 @@ class NewAgent(Agent):
         
         cue_pocketed = "cue" in new_pocketed
         eight_pocketed = "8" in new_pocketed
+        is_targeting_eight_legally = (len(player_targets) == 1 and player_targets[0] == "8")
 
         # Analyze first contact ball
         first_contact_ball_id = None
@@ -458,9 +459,9 @@ class NewAgent(Agent):
         
         # Check for foul: no first contact
         if first_contact_ball_id is None:
-            foul_first_hit = len(last_state) > 2
+            foul_first_hit = True
         else:
-            if player_targets == ['8']:
+            if is_targeting_eight_legally:
                 # Check for illegal first contact
                 if first_contact_ball_id != '8':
                     foul_first_hit = True
@@ -488,23 +489,19 @@ class NewAgent(Agent):
                                      (first_contact_ball_id and first_contact_ball_id in ids))
 
         # Check for foul: no rail contact
-        if (not new_pocketed and first_contact_ball_id is not None and 
-            not cue_hit_cushion and not target_hit_cushion):
+        if (len(new_pocketed) == 0 and not cue_hit_cushion and not target_hit_cushion):
             foul_no_rail = True
         
         # Calculate base score
         score = 0
         
         # Cue and eight ball penalties
+        
         if cue_pocketed and eight_pocketed:
-            is_targeting_eight_legally = (len(player_targets) == 1 and 
-                                         player_targets[0] == "8")
-            score += 200 if is_targeting_eight_legally else -500
+            score = -500
         elif cue_pocketed:
             score -= 30  # Minor penalty, game continues
         elif eight_pocketed:
-            is_targeting_eight_legally = (len(player_targets) == 1 and 
-                                         player_targets[0] == "8")
             score += 200 if is_targeting_eight_legally else -500
         
         # Foul penalties
@@ -516,25 +513,23 @@ class NewAgent(Agent):
         score -= len(enemy_pocketed) * 20
         
         # Default reward for no-event shots
-        if (score == 0 and not cue_pocketed and not eight_pocketed and 
-            not foul_first_hit and not foul_no_rail):
-            score = 10
+        if (not cue_pocketed and not eight_pocketed and 
+            not foul_first_hit and not foul_no_rail and score == 0):
+            score = 5 
         
         # ============ Dense Reward Signals ============
-        
-        is_targeting_eight_legally = (len(player_targets) == 1 and 
-                                     player_targets[0] == "8")
         
         # Distance penalties for eight ball (avoid accidental pocketing)
         if (not is_targeting_eight_legally and '8' in shot.balls and 
             shot.balls['8'].state.s != 4):
-            eight_pos = shot.balls['8'].state.rvw[0]
-            eight_dist = self._distance_to_nearest_pocket(eight_pos, table)
+            eight_before_dist = self._distance_to_nearest_pocket(last_state['8'].state.rvw[0], table)
+            eight_after_dist = self._distance_to_nearest_pocket(shot.balls['8'].state.rvw[0], table)
             
-            if eight_dist < 0.3:
-                score -= 100 * (0.3 - eight_dist) / 0.3
-            elif eight_dist > 0.3:
-                score += min(20, (eight_dist - 0.3) * 30)
+            # If eight ball is closer to pocket, give penalty
+            if eight_after_dist < eight_before_dist:
+                distance_decrease = eight_before_dist - eight_after_dist
+                penalty = distance_decrease * 150 
+                score -= penalty
         
         # Distance penalties for cue ball (avoid scratching)
         if not cue_pocketed and 'cue' in shot.balls:
@@ -572,6 +567,85 @@ class NewAgent(Agent):
             min_dist = min(min_dist, dist)
         return min_dist
     
+    def _check_fatal_failure(self, action, balls, my_targets, table, num_trials=10):
+        """
+        Check if an action leads to fatal failures (game-losing situations).
+        
+        Parameters:
+            action: dict with keys ['V0', 'phi', 'theta', 'a', 'b']
+            
+        Returns:
+            fatal_rate: Probability of fatal failure (0.0 to 1.0)
+            fatal_count: Number of fatal failures in trials
+        """
+        is_targeting_eight_legally = (my_targets == ['8'])
+        fatal_count = 0
+        error_count = 0
+        
+        for trial in range(num_trials):
+            try:
+                sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+                sim_table = copy.deepcopy(table)
+                cue = pt.Cue(cue_ball_id="cue")
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                
+                if self.enable_noise:
+                    noise = self.noise_std
+                    V0 = np.clip(action['V0'] + np.random.normal(0, noise['V0']), 0.5, 8.0)
+                    phi = (action['phi'] + np.random.normal(0, noise['phi'])) % 360
+                    theta = np.clip(action['theta'] + np.random.normal(0, noise['theta']), 0, 90)
+                    a = np.clip(action['a'] + np.random.normal(0, noise['a']), -0.5, 0.5)
+                    b = np.clip(action['b'] + np.random.normal(0, noise['b']), -0.5, 0.5)
+                    cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
+                else:
+                    cue.set_state(**action)
+                
+                pt.simulate(shot, inplace=True)
+                
+                original_balls = balls
+                
+                new_pocketed = [bid for bid in sim_balls.keys()
+                            if sim_balls[bid].state.s == 4 and original_balls[bid].state.s != 4]
+                
+                cue_pocketed = "cue" in new_pocketed
+                eight_pocketed = "8" in new_pocketed
+                
+                # Debug: print first trial
+                if trial == 0:
+                    print(f"[Fatal Check] Sample: cue={cue_pocketed}, eight={eight_pocketed}, pocketed={new_pocketed}")
+                
+                # Fatal condition 1: Cue and eight both pocketed
+                if cue_pocketed and eight_pocketed:
+                    fatal_count += 1
+                    continue
+                
+                # Fatal condition 2: Eight pocketed illegally (when not targeting it)
+                if eight_pocketed and not is_targeting_eight_legally:
+                    fatal_count += 1
+                    continue
+                    
+            except Exception as e:
+                if trial == 0:  
+                    print(f"[Fatal Check] Simulation error: {e}")
+                # Note: simulation errors are not considered fatal
+                error_count += 1
+                continue
+        
+        # Count successful simulations
+        success_count = num_trials - error_count
+    
+        # If successful simulations are zero, our action is guaranteed to fail
+        if success_count == 0:
+            print(f"[Fatal Check] WARNING: All {num_trials} trials failed to simulate")
+            return 1.0, num_trials
+        
+        if error_count > 0:
+            print(f"[Fatal Check] {error_count}/{num_trials} trials had errors")
+        
+        # Calculate fatal rate according to successful simulations
+        fatal_rate = fatal_count / success_count
+        return fatal_rate, fatal_count
+
     # ==================== Geometric Calculation ====================
     
     def _calc_ghost_ball(self, target_pos, pocket_pos):
@@ -692,13 +766,13 @@ class NewAgent(Agent):
                 score -= obstruction2 * 30
                 
                 # Black eight safety distance
-                if target_id != '8':
-                    dist_to_black_8 = self._calc_dist(target_pos, black_8_pos)
-                    min_safe_distance = 0.3
-                    if dist_to_black_8 < min_safe_distance:
-                        proximity_penalty = ((min_safe_distance - dist_to_black_8) / 
-                                           min_safe_distance) ** 2 * 200
-                        score -= proximity_penalty
+                # if target_id != '8':
+                #     dist_to_black_8 = self._calc_dist(target_pos, black_8_pos)
+                #     min_safe_distance = 0.3
+                #     if dist_to_black_8 < min_safe_distance:
+                #         proximity_penalty = ((min_safe_distance - dist_to_black_8) / 
+                #                            min_safe_distance) ** 2 * 200
+                #         score -= proximity_penalty
                 
                 all_choices.append((target_id, pocket_id, score))
         
@@ -767,32 +841,31 @@ class NewAgent(Agent):
             is_black_eight: if True, use stricter threshold (best_score >= 150)
         """
         
-        if not safe_mode:
-            pbounds = {
-                'V0': (max(0.5, geo_action['V0'] - 2.0), min(8.0, geo_action['V0'] + 2.0)),
-                'phi': (geo_action['phi'] - 20, geo_action['phi'] + 20),
-                'theta': (0, 15),
-                'a': (-0.3, 0.3),
-                'b': (-0.3, 0.3)
-            }
+        # if not safe_mode:
+        pbounds = {
+            'V0': (max(0.5, geo_action['V0'] - 2.0), min(8.0, geo_action['V0'] + 2.0)),
+            'phi': (geo_action['phi'] - 20, geo_action['phi'] + 20),
+            'theta': (0, 15),
+            'a': (-0.3, 0.3),
+            'b': (-0.3, 0.3)
+        }
             
-        else:
-            pbounds = {
-                'V0': (0.5, 2.0),  # Lower speeds for safety
-                'phi': (0, 360),
-                'theta': (0, 20),  # Gentler angles
-                'a': (-0.2, 0.2),
-                'b': (-0.2, 0.2)
-            }
+        # pbounds = {
+        #     'V0': (0.5, 2.0),  # Lower speeds for safety
+        #     'phi': (0, 360),
+        #     'theta': (0, 20),  # Gentler angles
+        #     'a': (-0.2, 0.2),
+        #     'b': (-0.2, 0.2)
+        # }
 
-        last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        # last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
         
-        try_times = 3 if not is_black_eight else 5
+        try_times = 3 if not is_black_eight else 6
 
         def reward_fn(V0, phi, theta, a, b):
             return self._evaluate_action(
                 {'V0': V0, 'phi': phi % 360, 'theta': theta, 'a': a, 'b': b},
-                3,
+                try_times,
                 balls, my_targets, table,
                 threshold=120 if is_black_eight else 10
             )
@@ -811,22 +884,17 @@ class NewAgent(Agent):
             )
 
             best = optimizer.max
-            threshold = 20 if not is_black_eight else 150
 
-            if best['target'] > threshold:
-                params = best['params']
-                final_action = {
-                    'V0': float(params['V0']),
-                    'phi': float(params['phi'] % 360),
-                    'theta': float(params['theta']),
-                    'a': float(params['a']),
-                    'b': float(params['b']),
-                }
-                print(f"[NewAgent] Optimization complete, score: {best['target']:.2f}")
-                return final_action, best['target']
-
-            print(f"[NewAgent] Optimization score {best['target']:.2f} < {threshold}")
-            return None, best['target']
+            params = best['params']
+            final_action = {
+                'V0': float(params['V0']),
+                'phi': float(params['phi'] % 360),
+                'theta': float(params['theta']),
+                'a': float(params['a']),
+                'b': float(params['b']),
+            }
+            print(f"[NewAgent] Optimization complete, score: {best['target']:.2f}")
+            return final_action, best['target']
 
         except Exception as e:
             print(f"[NewAgent] Optimization failed: {e}")
@@ -914,34 +982,63 @@ class NewAgent(Agent):
             best_action = None
             best_score = -float('inf')
             best_idx = 0
+            all_candidates = []  # Save all candidates
 
             for idx, (target_id, pocket_id, target_score) in enumerate(top_choices):
                 print(f"[NewAgent] Option {idx+1}: {target_id}→{pocket_id} (strategic score:{target_score:.2f})")
                 
                 geo_action = geo_results[idx][0]
                 action, score = self._bayesian_optimized(geo_action, 
-                                                      balls, my_targets, table, 
-                                                      is_black_eight=is_black_eight)
+                                                    balls, my_targets, table, 
+                                                    is_black_eight=is_black_eight)
                 
                 if action is not None:
+                    all_candidates.append((action, score, idx + 1))
+                    
                     if score > best_score:
                         best_score = score
                         best_action = action
                         best_idx = idx + 1
 
                     if not is_black_eight and best_score >= 60:
-                        print(f"[NewAgent] Option {best_idx} passed threshold 60, skip rest of the optimization")
+                        print(f"[NewAgent] Option {best_idx} passed threshold 60, skip rest")
                         return best_action
-                    
-            if best_action is None or best_score == -999:
-                print("[NewAgent] All options failed, using safe action")
-                action, score = self._bayesian_optimized(self._safe_action(), 
-                                                      balls, my_targets, table, 
-                                                      is_black_eight=is_black_eight, safe_mode=True)
-                
+                    if is_black_eight and best_score >= 220:
+                        print(f"[NewAgent] Option {best_idx} passed threshold 220, skip rest")
+                        return best_action
+
+            # ============ Safety Check ============
+            if not all_candidates:
+                print("[NewAgent] No valid actions found, using safe action")
                 return self._safe_action()
             
-            print(f"[NewAgent] Selected option {best_idx}, final score: {best_score:.2f}")
+            # If best score is below threshold, recheck fatal failure rates
+            RECHECK_THRESHOLD = 30 if not is_black_eight else 150  # Below this score needs recheck
+            
+            if best_score < RECHECK_THRESHOLD:
+                print(f"[NewAgent] Best score {best_score:.2f} < {RECHECK_THRESHOLD}, checking fatal failure rates...")
+                
+                # Evaluate each candidate's fatal failure rate
+                candidates_with_safety = []
+                for action, score, idx in all_candidates:
+                    fatal_rate, fatal_count = self._check_fatal_failure(action, balls, my_targets, table, num_trials=10)
+                    print(f"[NewAgent]   Option {idx}: score={score:.2f}, fatal_rate={fatal_rate:.1%} ({fatal_count}/10)")
+                    candidates_with_safety.append((action, score, idx, fatal_rate))
+                
+                # Filter out candidates with fatal failure rate below threshold
+                SAFE_FATAL_THRESHOLD = 0.2
+                safe_candidates = [(a, s, i, f) for a, s, i, f in candidates_with_safety 
+                                if f <= SAFE_FATAL_THRESHOLD]
+                
+                if safe_candidates:
+                    # Choose the safer option with the highest score
+                    best_action, best_score, best_idx, fatal_rate = max(safe_candidates, key=lambda x: x[1])
+                    print(f"[NewAgent] Selected safer option {best_idx}: score={best_score:.2f}, fatal_rate={fatal_rate:.1%}")
+                else:
+                    # If no safe candidate, return safe action
+                    return self._safe_action()
+            
+            print(f"[NewAgent] Final selection: option {best_idx}, score: {best_score:.2f}")
             return best_action
             
         except Exception as e:
