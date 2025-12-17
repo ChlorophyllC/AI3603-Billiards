@@ -379,6 +379,7 @@ class BasicAgent(Agent):
             traceback.print_exc()
             return self._random_action()
 
+import cma
 class NewAgent(Agent):
     """
     Optimized two-layer decision architecture agent for billiards.
@@ -400,7 +401,7 @@ class NewAgent(Agent):
             'a': 0.003,
             'b': 0.003
         }
-        self.enable_noise = True
+        self.enable_noise = False
         
         print("[NewAgent] Optimized agent initialized with improved reward function")
     
@@ -566,7 +567,7 @@ class NewAgent(Agent):
             min_dist = min(min_dist, dist)
         return min_dist
     
-    def _check_fatal_failure(self, action, balls, my_targets, table, num_trials=10):
+    def _check_fatal_failure(self, action, balls, my_targets, table, num_trials=10, fatal_threshold=0.1):
         """
         Check if an action leads to fatal failures (game-losing situations).
         
@@ -576,35 +577,40 @@ class NewAgent(Agent):
         Returns:
             fatal_rate: Probability of fatal failure (0.0 to 1.0)
             fatal_count: Number of fatal failures in trials
+            score: Newly calculated score based on more trials
         """
         is_targeting_eight_legally = (my_targets == ['8'])
         fatal_count = 0
         error_count = 0
-        
+        scores = []
         for trial in range(num_trials):
             try:
+                curr_fatal_rate = fatal_count / (trial + 1)
+                if curr_fatal_rate > fatal_threshold:
+                    return curr_fatal_rate, fatal_count, -999
                 sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
                 sim_table = copy.deepcopy(table)
                 cue = pt.Cue(cue_ball_id="cue")
                 shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
                 
-                if self.enable_noise:
-                    noise = self.noise_std
-                    V0 = np.clip(action['V0'] + np.random.normal(0, noise['V0']), 0.5, 8.0)
-                    phi = (action['phi'] + np.random.normal(0, noise['phi'])) % 360
-                    theta = np.clip(action['theta'] + np.random.normal(0, noise['theta']), 0, 90)
-                    a = np.clip(action['a'] + np.random.normal(0, noise['a']), -0.5, 0.5)
-                    b = np.clip(action['b'] + np.random.normal(0, noise['b']), -0.5, 0.5)
-                    cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
-                else:
-                    cue.set_state(**action)
+                noise = self.noise_std
+                V0 = np.clip(action['V0'] + np.random.normal(0, noise['V0']), 0.5, 8.0)
+                phi = (action['phi'] + np.random.normal(0, noise['phi'])) % 360
+                theta = np.clip(action['theta'] + np.random.normal(0, noise['theta']), 0, 90)
+                a = np.clip(action['a'] + np.random.normal(0, noise['a']), -0.5, 0.5)
+                b = np.clip(action['b'] + np.random.normal(0, noise['b']), -0.5, 0.5)
+                cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
                 
                 pt.simulate(shot, inplace=True)
-                
-                original_balls = balls
-                
+                trial_score = self._improved_reward_function(
+                    shot,
+                    {bid: copy.deepcopy(ball) for bid, ball in balls.items()},
+                    my_targets,
+                    sim_table
+                )
+                scores.append(trial_score)
                 new_pocketed = [bid for bid in sim_balls.keys()
-                            if sim_balls[bid].state.s == 4 and original_balls[bid].state.s != 4]
+                            if sim_balls[bid].state.s == 4 and balls[bid].state.s != 4]
                 
                 cue_pocketed = "cue" in new_pocketed
                 eight_pocketed = "8" in new_pocketed
@@ -636,14 +642,14 @@ class NewAgent(Agent):
         # If successful simulations are zero, our action is guaranteed to fail
         if success_count == 0:
             print(f"[Fatal Check] WARNING: All {num_trials} trials failed to simulate")
-            return 1.0, num_trials
+            return 1.0, num_trials, -999
         
         if error_count > 0:
             print(f"[Fatal Check] {error_count}/{num_trials} trials had errors")
         
         # Calculate fatal rate according to successful simulations
         fatal_rate = fatal_count / success_count
-        return fatal_rate, fatal_count
+        return fatal_rate, fatal_count, float(np.mean(scores))
 
     # ==================== Geometric Calculation ====================
     
@@ -664,9 +670,9 @@ class NewAgent(Agent):
         if dist < 0.3:
             V0 = 2.0
         elif dist < 0.8:
-            V0 = 3.0 + dist * 1.5
+            V0 = 2.0 + dist * 1.5
         else:
-            V0 = 5.0 + dist * 0.8
+            V0 = 4.0 + dist * 0.8
         V0 = min(V0, 7.5)
         
         return {
@@ -765,13 +771,13 @@ class NewAgent(Agent):
                 score -= obstruction2 * 30
                 
                 # Black eight safety distance
-                # if target_id != '8':
-                #     dist_to_black_8 = self._calc_dist(target_pos, black_8_pos)
-                #     min_safe_distance = 0.3
-                #     if dist_to_black_8 < min_safe_distance:
-                #         proximity_penalty = ((min_safe_distance - dist_to_black_8) / 
-                #                            min_safe_distance) ** 2 * 200
-                #         score -= proximity_penalty
+                if target_id != '8':
+                    dist_to_black_8 = self._calc_dist(target_pos, black_8_pos)
+                    min_safe_distance = 0.3
+                    if dist_to_black_8 < min_safe_distance:
+                        proximity_penalty = ((min_safe_distance - dist_to_black_8) / 
+                                           min_safe_distance) ** 2 * 150
+                        score -= proximity_penalty
                 
                 all_choices.append((target_id, pocket_id, score))
         
@@ -784,13 +790,13 @@ class NewAgent(Agent):
         return all_choices[:num_choices]
     
     # ==================== Optimization Search ====================
-    def _evaluate_action(self, action, trials, balls, my_targets, table, threshold=20):
+    def _evaluate_action(self, action, trials, balls, my_targets, table, threshold=20, enable_noise=False):
         """
         Evaluate action with early stopping mechanism.
         
         Parameters:
             threshold: if any single trial score < threshold, return immediately
-                      with current mean - 0.5*std instead of completing all trials
+                      with current mean instead of completing all trials
         """
         scores = []
         try:
@@ -800,7 +806,7 @@ class NewAgent(Agent):
                 cue = pt.Cue(cue_ball_id="cue")
                 shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
 
-                if self.enable_noise:
+                if enable_noise:
                     noise = self.noise_std
                     V0 = np.clip(action['V0'] + np.random.normal(0, noise['V0']), 0.5, 8.0)
                     phi = (action['phi'] + np.random.normal(0, noise['phi'])) % 360
@@ -825,43 +831,29 @@ class NewAgent(Agent):
                 
                 # Early stopping: if current trial score below threshold, return immediately
                 if trial_score < threshold:
-                    result = float(np.mean(scores) - 0.5 * np.std(scores))
+                    result = float(np.mean(scores))
                     return result
 
-            return float(np.mean(scores) - 0.5 * np.std(scores))
+            return float(np.mean(scores))
 
         except Exception as e:
             print(f"[NewAgent] Evaluation error: {e}")
             return -999
-            
-    import numpy as np
 
-    def _pso_optimized(self, geo_action, balls, my_targets, table, 
-                        is_black_eight=False, is_opening=False):
+    def _cma_es_optimized(self, geo_action, balls, my_targets, table, 
+                      is_black_eight=False, is_opening=False):
         """
-        快速PSO - 利用群体智能抗噪声，减少try_times
+        CMA-ES优化 - 加速版本
+        
+        优化策略:
+        1. 减少迭代次数和种群大小
+        2. 使用自适应 trials (开始用少量，接近收敛时增加)
+        3. 早停机制：连续N代无改进则停止
         """
+        initial_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
         
-        initial_balls_state = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-        
-        # PSO参数 - 增加粒子数，减少try_times
-        if is_opening:
-            print('[PSO] Opening detected: reduced to (5,3)')
-            n_particles = 5
-            n_iterations = 3
-        else:
-            n_particles = 10 if not is_black_eight else 15  # 更多粒子 = 更好的抗噪声
-            n_iterations = 5 if not is_black_eight else 8   # 减少迭代次数
-        
-        # 关键：每个粒子只评估1次（群体数量代替了重复评估）
-        try_times = 1  # ⭐ 从3/6降到1
-        threshold = 120 if is_black_eight else 10
-        
-        w = 0.7
-        c1 = 1.5
-        c2 = 1.5
-        
-        bounds = np.array([
+        # 原始边界
+        bounds_original = np.array([
             [max(0.5, geo_action['V0'] - 2.0), min(8.0, geo_action['V0'] + 2.0)],
             [geo_action['phi'] - 20, geo_action['phi'] + 20],
             [0, 15],
@@ -869,90 +861,99 @@ class NewAgent(Agent):
             [-0.3, 0.3]
         ])
         
-        particles = np.random.uniform(bounds[:, 0], bounds[:, 1], (n_particles, 5))
-        velocities = np.random.uniform(-0.1, 0.1, (n_particles, 5)) * (bounds[:, 1] - bounds[:, 0])
+        def normalize(x):
+            return (x - bounds_original[:, 0]) / (bounds_original[:, 1] - bounds_original[:, 0])
         
-        personal_best_positions = particles.copy()
-        personal_best_scores = np.full(n_particles, -float('inf'))
-        global_best_position = None
-        global_best_score = -float('inf')
+        def denormalize(x_norm):
+            return bounds_original[:, 0] + x_norm * (bounds_original[:, 1] - bounds_original[:, 0])
         
-        def evaluate_particle(position):
+        # 归一化的初始点
+        x0_norm = normalize(np.array([
+            geo_action['V0'],
+            geo_action['phi'],
+            geo_action['theta'],
+            geo_action['a'],
+            geo_action['b']
+        ]))
+        try_times = 1 if not is_black_eight else 2
+        # ========== 加速参数 ==========
+        # 更激进的参数设置
+        if is_opening:
+            maxiter = 3  # 开局更快
+            popsize = 3
+            sigma0 = 0.25
+        elif is_black_eight:
+            maxiter = 6  # 黑八稍微谨慎
+            popsize = 8
+            sigma0 = 0.15
+        else:
+            maxiter = 4  # 普通球快速
+            popsize = 6
+            sigma0 = 0.3
+        
+        opts = {
+            'bounds': [[0]*5, [1]*5],
+            'maxiter': maxiter,
+            'popsize': popsize,
+            'verb_disp': 0,
+            'verb_log': 0,
+            'tolfun': 1e-3,  # 提前收敛阈值（分数改进小于此值则停止）
+            'tolx': 1e-3     # 参数变化小于此值则停止
+        }
+        
+        # ========== 自适应trials策略 ==========
+        eval_count = [0]
+        
+        def objective(x_norm):
+            eval_count[0] += 1
+
+            x = denormalize(np.clip(x_norm, 0, 1))
+            
             restored_balls = {bid: copy.deepcopy(ball) 
-                            for bid, ball in initial_balls_state.items()}
+                            for bid, ball in initial_balls.items()}
             
             action = {
-                'V0': float(position[0]),
-                'phi': float(position[1] % 360),
-                'theta': float(position[2]),
-                'a': float(position[3]),
-                'b': float(position[4])
+                'V0': float(np.clip(x[0], 0.5, 8.0)),
+                'phi': float(x[1] % 360),
+                'theta': float(np.clip(x[2], 0, 90)),
+                'a': float(np.clip(x[3], -0.5, 0.5)),
+                'b': float(np.clip(x[4], -0.5, 0.5))
             }
             
-            return self._evaluate_action(
+            score = self._evaluate_action(
                 action, 
-                try_times,  # 只评估1次
+                try_times,
                 restored_balls, 
-                my_targets, table, 
-                threshold=threshold
+                my_targets, 
+                table,
+                threshold=10,
+                enable_noise=True if is_black_eight else False
             )
+            
+            return -score
         
-        for iteration in range(n_iterations):
-            for i in range(n_particles):
-                score = evaluate_particle(particles[i])
-                
-                if score > personal_best_scores[i]:
-                    personal_best_scores[i] = score
-                    personal_best_positions[i] = particles[i].copy()
-                
-                if score > global_best_score:
-                    global_best_score = score
-                    global_best_position = particles[i].copy()
-                    # print(f"[PSO] Iter {iteration+1}: score={score:.2f}")
+        try:
+            es = cma.CMAEvolutionStrategy(x0_norm, sigma0, opts)
+            es.optimize(objective)
             
-            if global_best_score >= (200 if is_black_eight else 80):
-                print(f"[PSO] Early stop at iteration {iteration+1}")
-                break
+            # 反归一化最优解
+            best_x = denormalize(np.clip(es.result.xbest, 0, 1))
+            best_score = -es.result.fbest
             
-            r1, r2 = np.random.rand(2)
-            for i in range(n_particles):
-                velocities[i] = (
-                    w * velocities[i] +
-                    c1 * r1 * (personal_best_positions[i] - particles[i]) +
-                    c2 * r2 * (global_best_position - particles[i])
-                )
-                particles[i] += velocities[i]
-                particles[i] = np.clip(particles[i], bounds[:, 0], bounds[:, 1])
-        
-        # ⭐ 最终最佳解：用多次评估确认
-        if global_best_position is not None:
-            print("[PSO] Validating best solution with multiple tries...")
-            final_try_times = 3 if not is_black_eight else 5
-            final_score = evaluate_particle(global_best_position)  # 用更多try_times验证
-            
-            # 手动重新评估最终解
-            restored_balls = {bid: copy.deepcopy(ball) 
-                            for bid, ball in initial_balls_state.items()}
-            final_action = {
-                'V0': float(global_best_position[0]),
-                'phi': float(global_best_position[1] % 360),
-                'theta': float(global_best_position[2]),
-                'a': float(global_best_position[3]),
-                'b': float(global_best_position[4])
+            best_action = {
+                'V0': float(np.clip(best_x[0], 0.5, 8.0)),
+                'phi': float(best_x[1] % 360),
+                'theta': float(np.clip(best_x[2], 0, 90)),
+                'a': float(np.clip(best_x[3], -0.5, 0.5)),
+                'b': float(np.clip(best_x[4], -0.5, 0.5))
             }
             
-            final_score = self._evaluate_action(
-                final_action, 
-                final_try_times,  # 最终验证用更多次
-                restored_balls, 
-                my_targets, table, 
-                threshold=threshold
-            )
+            print(f"[CMA-ES] Converged: score={best_score:.2f}, evals={es.result.evaluations}")
+            return best_action, best_score
             
-            print(f"[PSO] Final validated score: {final_score:.2f}")
-            return final_action, final_score
-        
-        return None, -999
+        except Exception as e:
+            print(f"[CMA-ES] Failed: {e}")
+            return None, -999
     
     # ==================== Game State Detection ====================
     
@@ -976,19 +977,20 @@ class NewAgent(Agent):
     
     def decision(self, balls=None, my_targets=None, table=None):
         """
-        Main decision function: select action based on game state.
+        Main decision function with early-stopping safety check.
         
-        For black eight: require best_score >= 150 and at least 5 valid choices
-        Otherwise: use normal strategy or fallback to optimized safe action
+        Strategy:
+        1. Evaluate geometric shots, return if good enough
+        2. Optimize candidates one-by-one
+        3. After each optimization, check safety immediately
+        4. Return first action that meets both score and safety thresholds
         """
         if not all([balls, my_targets, table]):
             print("[NewAgent] Incomplete parameters")
             return self._safe_action()
         
-        # is_opening = False
-        
         try:
-            # Detect opening state and reduce optimization iterations
+            # Detect opening state
             is_opening = self._detect_opening_state(balls)
             
             # Switch to black eight if all own balls pocketed
@@ -998,95 +1000,119 @@ class NewAgent(Agent):
                 print("[NewAgent] Switching to black eight")
             
             is_black_eight = (my_targets == ['8'])
-            
-            # Layer 1: Select best targets
+            cue_pos = balls['cue'].state.rvw[0]
+
+            # Define thresholds based on ball type
+            GEO_THRESHOLD = 220 if is_black_eight else 60
+            SCORE_THRESHOLD = 200 if is_black_eight else 50
+            SAFE_FATAL_THRESHOLD = 0  # Maximum allowed fatal failure rate
+            PRE_TRIALS = 8 if is_black_eight else 5
+
+            # ============ Layer 1: Select Best Targets ============
             num_choices = 5 if is_black_eight else 3
             top_choices = self._choose_top_targets(balls, my_targets, table, num_choices=num_choices)
             
             if not top_choices:
-                print("[NewAgent] No valid targets available, using optimized safe action")
+                print("[NewAgent] No valid targets available, using safe action")
                 return self._safe_action()
 
-            geo_results = []
-            geo_threshold = 40 if not is_black_eight else 200
+            # ============ Layer 2: Quick Geometric Check ============
+            all_initial_candidates = []
+            
             for target_id, pocket_id, target_score in top_choices:
-                pre_trials = 5 if not is_black_eight else 8
-                cue_pos = balls['cue'].state.rvw[0]
                 target_pos = balls[target_id].state.rvw[0]
                 pocket_pos = table.pockets[pocket_id].center
                 geo_action = self._geo_shot(cue_pos, target_pos, pocket_pos)
-                geo_score = self._evaluate_action(geo_action, pre_trials, balls, my_targets, table, 20)
-                if geo_score > geo_threshold:
-                    print(f"[NewAgent] geo_action {target_id}→{pocket_id}: {geo_score:.2f}>{geo_threshold}, skip optimization")
-                    return geo_action
-                geo_results.append((geo_action, geo_score))
+                geo_score = self._evaluate_action(
+                    geo_action, PRE_TRIALS, balls, my_targets, table, 20, True
+                )
                 
-            # Layer 2: Optimize top choices
-            best_action = None
-            best_score = -float('inf')
-            best_idx = 0
-            all_candidates = []  # Save all candidates
-
-            for idx, (target_id, pocket_id, target_score) in enumerate(top_choices):
-                print(f"[NewAgent] Option {idx+1}: {target_id}→{pocket_id} (strategic score:{target_score:.2f})")
-                
-                geo_action = geo_results[idx][0]
-                action, score = self._pso_optimized(geo_action, 
-                                                    balls, my_targets, table, 
-                                                    is_black_eight=is_black_eight, is_opening=is_opening)
-                
-                if action is not None:
-                    all_candidates.append((action, score, idx + 1))
+                # If geometric shot is excellent, check safety and return immediately
+                if geo_score > GEO_THRESHOLD:
+                    fatal_rate, fatal_count, verified_score = self._check_fatal_failure(
+                        geo_action, balls, my_targets, table, num_trials=15, 
+                        fatal_threshold=SAFE_FATAL_THRESHOLD
+                    )
+                    print(f"[NewAgent] Excellent geo_action {target_id}→{pocket_id}: "
+                        f"score={verified_score:.2f}, fatal_rate={fatal_rate:.1%}")
                     
-                    if score > best_score:
-                        best_score = score
-                        best_action = action
-                        best_idx = idx + 1
-
-                    if not is_black_eight and best_score >= 60:
-                        print(f"[NewAgent] Option {best_idx} passed threshold 60, skip rest")
-                        return best_action
-                    if is_black_eight and best_score >= 220:
-                        print(f"[NewAgent] Option {best_idx} passed threshold 220, skip rest")
-                        return best_action
-
-            # Layer 3: Safety Check
-            if not all_candidates:
-                print("[NewAgent] No valid actions found, using safe action")
-                return self._safe_action()
+                    if fatal_rate <= SAFE_FATAL_THRESHOLD and verified_score > 0:
+                        print(f"[NewAgent] Using excellent geometric shot (no optimization needed)")
+                        return geo_action
+                
+                all_initial_candidates.append((geo_action, geo_score, f'{target_id}→{pocket_id}'))
             
-            # If best score is below threshold, recheck fatal failure rates
-            RECHECK_THRESHOLD = 30 if not is_black_eight else 150  # Below this score needs recheck
+            # ============ Layer 3: Optimize with Early Stopping ============
+            num_to_optimize = 5 if is_black_eight else 3
+            all_initial_candidates.sort(key=lambda x: x[1], reverse=True)
+            top_candidates = all_initial_candidates[:num_to_optimize]
             
-            if best_score < RECHECK_THRESHOLD:
-                print(f"[NewAgent] Best score {best_score:.2f} < {RECHECK_THRESHOLD}, checking fatal failure rates...")
+            print(f"[NewAgent] Optimizing top {len(top_candidates)} candidates:")
+            for idx, (_, score, shot_type) in enumerate(top_candidates):
+                print(f"  {idx+1}. {shot_type}: {score:.1f}")
+            
+            # Track all evaluated candidates as fallback
+            all_evaluated = []
+            
+            for idx, (base_action, base_score, shot_type) in enumerate(top_candidates):
+                print(f"\n[NewAgent] Optimizing {idx+1}/{len(top_candidates)}: {shot_type}")
                 
-                # Evaluate each candidate's fatal failure rate
-                candidates_with_safety = []
-                for action, score, idx in all_candidates:
-                    fatal_rate, fatal_count = self._check_fatal_failure(action, balls, my_targets, table, num_trials=10)
-                    print(f"[NewAgent]   Option {idx}: score={score:.2f}, fatal_rate={fatal_rate:.1%} ({fatal_count}/10)")
-                    candidates_with_safety.append((action, score, idx, fatal_rate))
+                # Optimize
+                opt_action, opt_score = self._cma_es_optimized(
+                    base_action, balls, my_targets, table, 
+                    is_black_eight=is_black_eight, is_opening=is_opening
+                )
                 
-                # Filter out candidates with fatal failure rate below threshold
-                SAFE_FATAL_THRESHOLD = 0
-                safe_candidates = [(a, s, i, f) for a, s, i, f in candidates_with_safety 
-                                if f <= SAFE_FATAL_THRESHOLD]
-                
-                if safe_candidates:
-                    # Choose the safer option with the highest score
-                    best_action, best_score, best_idx, fatal_rate = max(safe_candidates, key=lambda x: x[1])
-                    print(f"[NewAgent] Selected safer option {best_idx}: score={best_score:.2f}, fatal_rate={fatal_rate:.1%}")
+                # Use optimized if successful, otherwise use base
+                if opt_action is not None:
+                    action_to_check = opt_action
+                    score_to_check = opt_score
+                    print(f"[NewAgent] Optimization improved score: {base_score:.2f} → {opt_score:.2f}")
                 else:
-                    # If no safe candidate, return safe action
-                    return self._safe_action()
+                    action_to_check = base_action
+                    score_to_check = base_score
+                    print(f"[NewAgent] Optimization failed, using base action")
+                
+                # Immediate safety check
+                fatal_rate, fatal_count, verified_score = self._check_fatal_failure(
+                    action_to_check, balls, my_targets, table, num_trials=15,
+                    fatal_threshold=SAFE_FATAL_THRESHOLD
+                )
+                
+                print(f"[NewAgent] {shot_type}: score={verified_score:.2f}, "
+                    f"fatal_rate={fatal_rate:.1%} ({fatal_count}/15 fatal)")
+                
+                all_evaluated.append((action_to_check, verified_score, shot_type, fatal_rate))
+                
+                # Early stopping: if this action meets both thresholds, use it immediately
+                if verified_score >= SCORE_THRESHOLD and fatal_rate <= SAFE_FATAL_THRESHOLD:
+                    print(f"[NewAgent] ✓ Found acceptable action: {shot_type} "
+                        f"(score={verified_score:.2f}, fatal_rate={fatal_rate:.1%})")
+                    return action_to_check
             
-            print(f"[NewAgent] Final selection: option {best_idx}, score: {best_score:.2f}")
-            return best_action
+            # ============ Layer 4: Fallback Selection ============
+            print(f"\n[NewAgent] No action met threshold (score>={SCORE_THRESHOLD}), "
+                f"selecting best safe option...")
+            
+            # Filter safe candidates (fatal_rate <= threshold)
+            safe_candidates = [(a, s, st, f) for a, s, st, f in all_evaluated 
+                            if f <= SAFE_FATAL_THRESHOLD]
+            
+            if safe_candidates:
+                # Select highest scoring safe action
+                best_action, best_score, best_type, fatal_rate = max(safe_candidates, key=lambda x: x[1])
+                
+                if best_score > 0:
+                    print(f"[NewAgent] Using best safe option: {best_type} "
+                        f"(score={best_score:.2f}, fatal_rate={fatal_rate:.1%})")
+                    return best_action
+            
+            # Last resort: use safe action
+            print(f"[NewAgent] No safe options with positive score, using defensive safe action")
+            return self._safe_action()
             
         except Exception as e:
             print(f"[NewAgent] Decision failed: {e}")
             import traceback
             traceback.print_exc()
             return self._safe_action()
-        
