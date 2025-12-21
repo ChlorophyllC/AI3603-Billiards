@@ -1233,8 +1233,8 @@ class NewAgent(Agent):
                             balls=balls,
                             my_targets=my_targets,
                             table=table,
-                            chosen_action=best_action,
-                            action_score=best_score
+                            chosen_action=action_to_check,
+                            action_score=verified_score
                         )
                     return action_to_check
             
