@@ -379,7 +379,185 @@ class BasicAgent(Agent):
             traceback.print_exc()
             return self._random_action()
 
+import time
+import json
+class ImitationDataCollector:
+    """收集模仿学习数据"""
+    
+    def __init__(self, save_dir="./imitation_data"):
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        self.current_session = []
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 台球桌常量
+        self.TABLE_WIDTH = 1.9812
+        self.TABLE_HEIGHT = 0.9906
+        self.BALL_RADIUS = 0.028575
+    
+    def record_decision(self, 
+                       balls, 
+                       my_targets, 
+                       table,
+                       chosen_action,      # Teacher选择的动作
+                       action_score,       # 该动作的评估分数
+                       game_result=None):  # 最终游戏结果（可选）
+        """
+        记录一次完整的决策
+        
+        关键：记录整个球桌状态 + Teacher的最优选择
+        """
+        
+        # === 提取状态特征 ===
+        state_features = self._extract_state_features(
+            balls, my_targets, table)
+        
+        # === 构造训练样本 ===
+        sample = {
+            'timestamp': datetime.now().isoformat(),
+            'session_id': self.session_id,
+            
+            # 状态（输入）
+            'state': state_features,
+            
+            # 动作（标签）
+            'action': {
+                'V0': float(chosen_action['V0']),
+                'phi': float(chosen_action['phi']),
+                'theta': float(chosen_action['theta']),
+                'a': float(chosen_action['a']),
+                'b': float(chosen_action['b'])
+            },
+            
+            # 质量指标
+            'action_score': float(action_score),
+            'is_high_quality': action_score >= 60,  # 只学习高质量决策
+            
+            # 元信息
+            'is_eight_ball': (my_targets == ['8']),
+            'game_result': game_result  # 'win' / 'loss' / None
+        }
+        
+        self.current_session.append(sample)
+        
+        # 自动保存
+        if len(self.current_session) >= 20:
+            self.save_session()
+        
+        return sample
+    
+    def _extract_state_features(self, balls, my_targets, table):
+        """
+        提取完整的球桌状态特征
+        
+        关键：给Student足够信息来做决策
+        """
+        features = {}
+        
+        # === 母球位置 ===
+        cue_pos = balls['cue'].state.rvw[0]
+        features['cue_x'] = float(cue_pos[0] / (self.TABLE_WIDTH / 2))
+        features['cue_y'] = float(cue_pos[1] / (self.TABLE_HEIGHT / 2))
+        
+        # === 我方球的位置（最多7个）===
+        my_balls = []
+        for i in range(1, 16):
+            ball_id = str(i)
+            if ball_id in my_targets and ball_id != '8':
+                if balls[ball_id].state.s != 4:  # 未入袋
+                    pos = balls[ball_id].state.rvw[0]
+                    my_balls.append({
+                        'id': ball_id,
+                        'x': float(pos[0] / (self.TABLE_WIDTH / 2)),
+                        'y': float(pos[1] / (self.TABLE_HEIGHT / 2))
+                    })
+        
+        # Padding到7个球
+        while len(my_balls) < 7:
+            my_balls.append({'id': 'none', 'x': 0.0, 'y': 0.0})
+        
+        features['my_balls'] = my_balls
+        features['my_balls_remaining'] = len([b for b in my_balls if b['id'] != 'none'])
+        
+        # === 对手的球（用于防守判断）===
+        opponent_balls = []
+        opponent_ids = [str(i) for i in range(1, 16) 
+                       if str(i) not in my_targets + ['8']]
+        
+        for ball_id in opponent_ids:
+            if balls[ball_id].state.s != 4:
+                pos = balls[ball_id].state.rvw[0]
+                opponent_balls.append({
+                    'id': ball_id,
+                    'x': float(pos[0] / (self.TABLE_WIDTH / 2)),
+                    'y': float(pos[1] / (self.TABLE_HEIGHT / 2))
+                })
+        
+        while len(opponent_balls) < 7:
+            opponent_balls.append({'id': 'none', 'x': 0.0, 'y': 0.0})
+        
+        features['opponent_balls'] = opponent_balls
+        features['opponent_balls_remaining'] = len([b for b in opponent_balls if b['id'] != 'none'])
+        
+        # === 8号球状态 ===
+        if '8' in balls and balls['8'].state.s != 4:
+            eight_pos = balls['8'].state.rvw[0]
+            features['eight_x'] = float(eight_pos[0] / (self.TABLE_WIDTH / 2))
+            features['eight_y'] = float(eight_pos[1] / (self.TABLE_HEIGHT / 2))
+            features['eight_active'] = 1.0
+        else:
+            features['eight_x'] = 0.0
+            features['eight_y'] = 0.0
+            features['eight_active'] = 0.0
+        
+        # === 游戏阶段 ===
+        features['is_eight_ball_game'] = float(my_targets == ['8'])
+        features['is_opening'] = float(
+            features['my_balls_remaining'] >= 6 and 
+            features['opponent_balls_remaining'] >= 6
+        )
+        features['is_endgame'] = float(
+            features['my_balls_remaining'] <= 2 or
+            features['opponent_balls_remaining'] <= 2
+        )
+        
+        # === 袋口位置（固定，但包含进来）===
+        pocket_positions = []
+        for pocket_name, pocket in table.pockets.items():
+            pocket_positions.append({
+                'name': pocket_name,
+                'x': float(pocket.center[0] / (self.TABLE_WIDTH / 2)),
+                'y': float(pocket.center[1] / (self.TABLE_HEIGHT / 2))
+            })
+        features['pockets'] = pocket_positions
+        
+        return features
+    
+    def save_session(self):
+        """保存数据"""
+        if not self.current_session:
+            return
+        
+        filename = f"{self.save_dir}/session_{self.session_id}.json"
+        
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
+                existing_data = json.load(f)
+        else:
+            existing_data = []
+        
+        existing_data.extend(self.current_session)
+        
+        with open(filename, 'w') as f:
+            json.dump(existing_data, f, indent=2)
+        
+        print(f"[ImitationCollector] ✓ Saved {len(self.current_session)} decisions "
+              f"(total: {len(existing_data)})")
+        
+        self.current_session = []
+
 import cma
+
 class NewAgent(Agent):
     """
     Advanced pool agent with strategic offense and defense capabilities.
@@ -411,6 +589,9 @@ class NewAgent(Agent):
             'b': 0.003
         }
         
+        self.imitation_collector = ImitationDataCollector()
+        self.collect_imitation_data = True
+
         print("[Agent] Strategic pool agent initialized with offense/defense capabilities")
     
     # ============================================================================
@@ -1046,6 +1227,15 @@ class NewAgent(Agent):
 
                 if verified_score >= SCORE_THRESHOLD and fatal_rate <= SAFE_FATAL_THRESHOLD:
                     print(f"[NewAgent] ✓ Found acceptable action early.")
+
+                    if self.collect_imitation_data:
+                        self.imitation_collector.record_decision(
+                            balls=balls,
+                            my_targets=my_targets,
+                            table=table,
+                            chosen_action=best_action,
+                            action_score=best_score
+                        )
                     return action_to_check
             
             # Layer 4: Fallback Selection (Offensive)
@@ -1056,6 +1246,16 @@ class NewAgent(Agent):
                 
                 if best_score > 10: # Only take the shot if it's reasonably good
                     print(f"[NewAgent] Using best safe option: {best_type} (score={best_score:.2f})")
+
+                    if self.collect_imitation_data:
+                        self.imitation_collector.record_decision(
+                            balls=balls,
+                            my_targets=my_targets,
+                            table=table,
+                            chosen_action=best_action,
+                            action_score=best_score
+                        )
+
                     return best_action
 
             # Final Fallback: Switch to Defensive Strategy
