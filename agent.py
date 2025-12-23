@@ -379,30 +379,109 @@ class BasicAgent(Agent):
             traceback.print_exc()
             return self._random_action()
 
-import cma
+
+class MultiHeadPoolPolicyNetwork(nn.Module):
+    """和 train_student.py 对齐的多头策略网络。
+
+    输出 [B, K, 6]：
+      [V0_norm, sin(phi), cos(phi), theta_norm, a01, b01]
+    """
+
+    def __init__(self, input_dim, num_heads=5, action_dim=6):
+        super().__init__()
+        self.num_heads = int(num_heads)
+        self.action_dim = int(action_dim)
+
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.LayerNorm(256),
+            nn.Dropout(0.2),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.LayerNorm(256),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.LayerNorm(128),
+        )
+
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(128, 64),
+                nn.ReLU(),
+                nn.Linear(64, self.action_dim),
+            )
+            for _ in range(self.num_heads)
+        ])
+
+    def forward(self, state):
+        feat = self.encoder(state)
+        outs = []
+        for head in self.heads:
+            raw = head(feat)
+            v0 = torch.sigmoid(raw[:, 0:1])
+            sincos = torch.tanh(raw[:, 1:3])
+            norm = torch.sqrt((sincos ** 2).sum(dim=1, keepdim=True)).clamp_min(1e-6)
+            sincos = sincos / norm
+            theta = torch.sigmoid(raw[:, 3:4])
+            ab = torch.sigmoid(raw[:, 4:6])
+            outs.append(torch.cat([v0, sincos, theta, ab], dim=1))
+
+        return torch.stack(outs, dim=1)
+
+
 class NewAgent(Agent):
     """
-    Advanced pool agent with strategic offense and defense capabilities.
-    Uses CMA-ES optimization for shot refinement and evaluates safety plays.
+    Neural network-based agent with safety fallback mechanisms.
     """
     
-    def __init__(self):
+    def __init__(self, model_path='best_student_imitation.pth'):
         super().__init__()
-        
-        # Table and ball constants
         self.BALL_RADIUS = 0.028575
         self.TABLE_WIDTH = 1.9812
         self.TABLE_HEIGHT = 0.9906
-        
-        # Cushion positions for banking calculations
+
         self.cushions = {
-            'x_pos': self.TABLE_WIDTH / 2,
-            'x_neg': -self.TABLE_WIDTH / 2,
-            'y_pos': self.TABLE_HEIGHT / 2,
+            'x_pos': self.TABLE_WIDTH / 2, 
+            'x_neg': -self.TABLE_WIDTH / 2, 
+            'y_pos': self.TABLE_HEIGHT / 2, 
             'y_neg': -self.TABLE_HEIGHT / 2
         }
         
-        # Noise parameters for robustness testing
+        # 初始化神经网络
+        self.input_dim = 2 + 7*3 + 7*3 + 3 + 3 + 2  # 47维
+        self.NUM_CANDIDATES = 5
+        self.model = MultiHeadPoolPolicyNetwork(self.input_dim, num_heads=self.NUM_CANDIDATES, action_dim=6)
+        
+        # 加载训练好的权重
+        try:
+            self.model.load_state_dict(torch.load(model_path, map_location='cpu'))
+            self.model.eval()
+            print(f"[NeuralAgent] Successfully loaded model from {model_path}")
+        except Exception as e:
+            print(f"[NeuralAgent] Warning: Failed to load model: {e}")
+            self.model = None
+        
+        # Safety thresholds
+        self.SAFE_SCORE_THRESHOLD = 20.0  # 神经网络预测的最低可接受分数
+        self.FATAL_RATE_THRESHOLD = 0.15  # 最大可接受的致命失误率
+        self.SCORE_THRESHOLD_NORMAL = 45.0
+        self.SCORE_THRESHOLD_EIGHT = 60.0
+        self.NET_EVAL_TRIALS = 3
+        self.LOCAL_PERTURB_STEPS = 6
+        self.LOCAL_PERTURB_SCALE = {
+            'V0': 0.8,
+            'phi': 5.0,
+            'theta': 2.0,
+            'a': 0.03,
+            'b': 0.03,
+        }
+        self.USE_LOCAL = True
+        self.CMA_MAXITER = 3
+        self.CMA_POPSIZE = 3
+        self.CMA_SIGMA = 0.2
+        
         self.noise_std = {
             'V0': 0.1,
             'phi': 0.1,
@@ -410,156 +489,203 @@ class NewAgent(Agent):
             'a': 0.003,
             'b': 0.003
         }
-        
-        print("[Agent] Strategic pool agent initialized with offense/defense capabilities")
+
+        print("[NeuralAgent] Neural network agent with safety fallback initialized.")
     
-    # ============================================================================
-    # Basic Utility Functions
-    # ============================================================================
+    # ==================== Utility Functions ====================
     
     def _safe_action(self):
-        """Return a no-op action when all else fails."""
         return {'V0': 0, 'phi': 0, 'theta': 0, 'a': 0, 'b': 0}
     
     def _calc_dist(self, pos1, pos2):
-        """Calculate 2D Euclidean distance between two positions."""
         return np.linalg.norm(np.array(pos1[:2]) - np.array(pos2[:2]))
     
     def _unit_vector(self, vec):
-        """Normalize a 2D vector to unit length."""
         vec = np.array(vec[:2])
         norm = np.linalg.norm(vec)
         return np.array([1.0, 0.0]) if norm < 1e-6 else vec / norm
     
     def _direction_to_degrees(self, direction_vec):
-        """Convert a direction vector to angle in degrees [0, 360)."""
         phi = np.arctan2(direction_vec[1], direction_vec[0]) * 180 / np.pi
         return phi % 360
     
-    def _distance_to_nearest_pocket(self, ball_pos, table):
-        """Find the shortest distance from a ball position to any pocket."""
-        return min(self._calc_dist(ball_pos, pocket.center) 
-                   for pocket in table.pockets.values())
+    # ==================== Feature Extraction ====================
     
-    # ============================================================================
-    # Reward and Evaluation Functions
-    # ============================================================================
+    def _ball_features_from_pooltool(self, ball):
+        """从 pooltool ball 对象提取特征 [x, y, exist] - 和数据收集完全一致"""
+        if ball.state.s == 4:  # 球已入袋
+            return [0.0, 0.0, 0.0]
+        else:
+            pos = ball.state.rvw[0]
+            return [
+                float(pos[0] / (self.TABLE_WIDTH / 2)),
+                float(pos[1] / (self.TABLE_HEIGHT / 2)),
+                1.0
+            ]
+    
+    def _extract_state_features(self, balls, my_targets):
+        """
+        提取状态特征 - 和数据收集完全一致
+        
+        关键：数据收集时是按 1-15 顺序遍历，只选 my_targets 中的球
+        """
+        features = []
+        
+        # 1. Cue ball position (2)
+        cue_pos = balls['cue'].state.rvw[0]
+        features.extend([
+            float(cue_pos[0] / (self.TABLE_WIDTH / 2)),
+            float(cue_pos[1] / (self.TABLE_HEIGHT / 2))
+        ])
+        
+        # 2. My balls (7 × 3 = 21)
+        # 数据收集时：for i in range(1, 16): if ball_id in my_targets and ball_id != '8'
+        # 所以要按 1-15 顺序遍历，而不是对 my_targets 排序！
+        my_balls_list = []
+        for i in range(1, 16):
+            ball_id = str(i)
+            if ball_id in my_targets and ball_id != '8':
+                if ball_id in balls and balls[ball_id].state.s != 4:
+                    my_balls_list.append(self._ball_features_from_pooltool(balls[ball_id]))
+                # 注意：数据收集时如果球入袋了就不加入列表！
+        
+        # Padding到7个
+        for i in range(7):
+            if i < len(my_balls_list):
+                features.extend(my_balls_list[i])
+            else:
+                features.extend([0.0, 0.0, 0.0])
+        
+        # 3. Opponent balls (7 × 3 = 21)
+        # 同样按 1-15 顺序遍历
+        opponent_balls_list = []
+        for i in range(1, 16):
+            ball_id = str(i)
+            if ball_id not in my_targets and ball_id != '8':
+                if ball_id in balls and balls[ball_id].state.s != 4:
+                    opponent_balls_list.append(self._ball_features_from_pooltool(balls[ball_id]))
+        
+        for i in range(7):
+            if i < len(opponent_balls_list):
+                features.extend(opponent_balls_list[i])
+            else:
+                features.extend([0.0, 0.0, 0.0])
+        
+        # 4. Eight ball (3)
+        if '8' in balls and balls['8'].state.s != 4:
+            features.extend(self._ball_features_from_pooltool(balls['8']))
+        else:
+            features.extend([0.0, 0.0, 0.0])
+        
+        # 5. Phase flags (3)
+        is_eight_ball_game = float(my_targets == ['8'])
+        
+        my_balls_remaining = len(my_balls_list)
+        opponent_balls_remaining = len(opponent_balls_list)
+        
+        # 数据收集时的判断逻辑
+        is_opening = float(
+            my_balls_remaining >= 6 and opponent_balls_remaining >= 6
+        )
+        is_endgame = float(
+            my_balls_remaining <= 2 or opponent_balls_remaining <= 2
+        )
+        
+        features.extend([is_eight_ball_game, is_opening, is_endgame])
+        
+        # 6. Remaining counts (2)
+        features.extend([
+            my_balls_remaining / 7.0,
+            opponent_balls_remaining / 7.0
+        ])
+        
+        return torch.FloatTensor(features).unsqueeze(0)
+    
+    def _denormalize_action(self, normalized_action):
+        """将网络输出转换回环境动作。
+
+        normalized_action 维度为 6：
+          [V0_norm, sin(phi), cos(phi), theta_norm, a01, b01]
+          
+        关键：必须与train_student.py中的_extract_action完全对应！
+        训练时：V0_norm = (V0-0.5)/7.5, theta_norm = theta/90, a01 = a+0.5
+        推理时：V0 = V0_norm*7.5+0.5, theta = theta_norm*90, a = a01-0.5
+        """
+        # V0: [0,1] -> [0.5, 8.0]
+        V0 = float(normalized_action[0]) * 7.5 + 0.5
+        
+        # phi: 从sin/cos恢复角度
+        sin_phi = float(normalized_action[1])
+        cos_phi = float(normalized_action[2])
+        phi = float(np.arctan2(sin_phi, cos_phi) * 180.0 / np.pi)
+        phi = phi % 360.0  # 确保在[0, 360)
+        
+        # theta: [0,1] -> [0, 90]
+        theta = float(normalized_action[3]) * 90.0
+        
+        # a, b: [0,1] -> [-0.5, 0.5]
+        a = float(normalized_action[4]) - 0.5
+        b = float(normalized_action[5]) - 0.5
+
+        return {
+            'V0': float(np.clip(V0, 0.5, 8.0)),
+            'phi': float(phi),
+            'theta': float(np.clip(theta, 0, 90)),
+            'a': float(np.clip(a, -0.5, 0.5)),
+            'b': float(np.clip(b, -0.5, 0.5))
+        }
+    
+    # ==================== Safety Check ====================
     
     def _improved_reward_function(self, shot, last_state, player_targets, table):
-        """
-        Enhanced reward function that penalizes risky eight-ball positioning
-        and rewards safe cue ball placement.
-        """
-        base_score = analyze_shot_for_reward(shot, last_state, player_targets)
+        """评估击球质量"""
+        score = analyze_shot_for_reward(shot, last_state, player_targets)
         
-        # Check if we're legally targeting the eight ball
-        targeting_eight = (player_targets == ['8'])
+        is_targeting_eight_legally = (player_targets == ['8'])
         
-        # Penalize moving eight ball closer to pockets when not targeting it
-        if not targeting_eight and '8' in shot.balls and shot.balls['8'].state.s != 4:
-            eight_before = self._distance_to_nearest_pocket(
-                last_state['8'].state.rvw[0], table)
-            eight_after = self._distance_to_nearest_pocket(
-                shot.balls['8'].state.rvw[0], table)
-            
-            if eight_after < eight_before:
-                base_score -= (eight_before - eight_after) * 150
+        # 惩罚非法移动黑8
+        if not is_targeting_eight_legally and '8' in shot.balls and shot.balls['8'].state.s != 4:
+            eight_before_dist = self._distance_to_nearest_pocket(
+                last_state['8'].state.rvw[0], table
+            )
+            eight_after_dist = self._distance_to_nearest_pocket(
+                shot.balls['8'].state.rvw[0], table
+            )
+            if eight_after_dist < eight_before_dist:
+                score -= (eight_before_dist - eight_after_dist) * 150
         
-        # Reward keeping cue ball away from pockets (unless scratched)
-        cue_pocketed = "cue" in [bid for bid, b in shot.balls.items() 
-                                  if b.state.s == 4]
-        
+        # 白球安全性评估
+        cue_pocketed = "cue" in [bid for bid, b in shot.balls.items() if b.state.s == 4]
         if not cue_pocketed and 'cue' in shot.balls:
             cue_pos = shot.balls['cue'].state.rvw[0]
             cue_dist = self._distance_to_nearest_pocket(cue_pos, table)
-            
             if cue_dist < 0.1:
-                # Heavy penalty for cue ball near pocket
-                base_score -= 30 * (0.1 - cue_dist) / 0.1
+                score -= 30 * (0.1 - cue_dist) / 0.1
             elif cue_dist > 0.2:
-                # Reward for safe positioning
-                base_score += min(15, cue_dist * 20)
+                score += min(15, cue_dist * 20)
         
-        return base_score
+        return score
     
-    def _evaluate_action(self, action, trials, balls, my_targets, table, 
-                        threshold=20, enable_noise=False):
-        """
-        Simulate an action multiple times and return average reward.
-        Early termination if consistently poor.
-        """
+    def _distance_to_nearest_pocket(self, ball_pos, table):
+        """计算球到最近袋口的距离"""
+        min_dist = float('inf')
+        for pocket in table.pockets.values():
+            dist = self._calc_dist(ball_pos, pocket.center)
+            min_dist = min(min_dist, dist)
+        return min_dist
+    
+    def _evaluate_action_safety(self, action, balls, my_targets, table, num_trials=10):
+        """评估动作的安全性和预期得分"""
         scores = []
-        
-        try:
-            for trial_num in range(trials):
-                # Deep copy game state for simulation
-                sim_balls = {bid: copy.deepcopy(ball) 
-                            for bid, ball in balls.items()}
-                sim_table = copy.deepcopy(table)
-                shot = pt.System(table=sim_table, balls=sim_balls, 
-                               cue=pt.Cue(cue_ball_id="cue"))
-                
-                # Apply noise if requested for robustness testing
-                if enable_noise:
-                    noise = self.noise_std
-                    V0 = action['V0'] + np.random.normal(0, noise['V0'])
-                    phi = (action['phi'] + np.random.normal(0, noise['phi'])) % 360
-                    theta = action['theta'] + np.random.normal(0, noise['theta'])
-                    a = action['a'] + np.random.normal(0, noise['a'])
-                    b = action['b'] + np.random.normal(0, noise['b'])
-                    
-                    shot.cue.set_state(
-                        V0=np.clip(V0, 0.5, 8.0),
-                        phi=phi,
-                        theta=np.clip(theta, 0, 90),
-                        a=np.clip(a, -0.5, 0.5),
-                        b=np.clip(b, -0.5, 0.5)
-                    )
-                else:
-                    shot.cue.set_state(**action)
-                
-                # Run simulation
-                if not simulate_with_timeout(shot, timeout=3):
-                    scores.append(-100)
-                    continue
-                
-                trial_score = self._improved_reward_function(
-                    shot, balls, my_targets, sim_table)
-                scores.append(trial_score)
-                
-                # Early exit if consistently bad
-                if trial_score < threshold and len(scores) > 1:
-                    return float(np.mean(scores))
-            
-            return float(np.mean(scores))
-            
-        except Exception:
-            return -999
-    
-    def _check_fatal_failure(self, action, balls, my_targets, table, 
-                            num_trials=10, fatal_threshold=0.1):
-        """
-        Check for catastrophic outcomes (scratching eight ball, etc.).
-        Returns (fatal_rate, fatal_count, avg_score).
-        """
-        targeting_eight = (my_targets == ['8'])
         fatal_count = 0
-        error_count = 0
-        scores = []
+        is_targeting_eight_legally = (my_targets == ['8'])
         
-        for trial in range(num_trials):
+        for _ in range(num_trials):
             try:
-                # Early termination if fatal rate is already too high
-                if fatal_count / (trial + 1) > fatal_threshold + 0.1:
-                    break
-                
-                # Simulate with noise
-                sim_balls = {bid: copy.deepcopy(ball) 
-                            for bid, ball in balls.items()}
+                sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
                 sim_table = copy.deepcopy(table)
-                shot = pt.System(table=sim_table, balls=sim_balls,
-                               cue=pt.Cue(cue_ball_id="cue"))
-                
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=pt.Cue(cue_ball_id="cue"))
+
                 noise = self.noise_std
                 V0 = action['V0'] + np.random.normal(0, noise['V0'])
                 phi = (action['phi'] + np.random.normal(0, noise['phi'])) % 360
@@ -576,493 +702,332 @@ class NewAgent(Agent):
                 )
                 
                 if not simulate_with_timeout(shot, timeout=3):
-                    error_count += 1
+                    scores.append(-100)
                     continue
                 
-                scores.append(self._improved_reward_function(
-                    shot, balls, my_targets, sim_table))
+                score = self._improved_reward_function(shot, balls, my_targets, sim_table)
+                scores.append(score)
                 
-                # Check for fatal outcomes
-                new_pocketed = [bid for bid, ball in shot.balls.items()
+                # 检查致命失误
+                new_pocketed = [bid for bid, ball in shot.balls.items() 
                                if ball.state.s == 4 and balls[bid].state.s != 4]
-                
                 if "cue" in new_pocketed and "8" in new_pocketed:
                     fatal_count += 1
-                elif "8" in new_pocketed and not targeting_eight:
+                elif "8" in new_pocketed and not is_targeting_eight_legally:
                     fatal_count += 1
                     
             except Exception:
-                error_count += 1
+                scores.append(-100)
         
-        success_count = num_trials - error_count
-        if success_count == 0:
-            return 1.0, num_trials, -999
+        avg_score = float(np.mean(scores)) if scores else -999
+        fatal_rate = fatal_count / num_trials
         
-        fatal_rate = fatal_count / success_count
-        avg_score = float(np.mean(scores)) if scores else -500
-        
-        return fatal_rate, fatal_count, avg_score
+        return avg_score, fatal_rate
     
-    # ============================================================================
-    # Geometric Shot Calculations
-    # ============================================================================
+    # ==================== Defensive Strategy (Fallback) ====================
+    
+    def _get_opponent_targets(self, my_targets):
+        """确定对手的目标球"""
+        all_targets = set(str(i) for i in range(1, 16))
+        my_set = set(my_targets)
+        opponent_set = all_targets - my_set - {'8'}
+        return list(opponent_set)
     
     def _calc_ghost_ball(self, target_pos, pocket_pos):
-        """
-        Calculate ghost ball position for perfect contact.
-        Ghost ball is where cue ball should be at moment of contact.
-        """
-        direction = self._unit_vector(
-            np.array(pocket_pos[:2]) - np.array(target_pos[:2]))
+        direction = self._unit_vector(np.array(pocket_pos[:2]) - np.array(target_pos[:2]))
         return np.array(target_pos[:2]) - direction * (2 * self.BALL_RADIUS)
     
-    def _calculate_cut_angle(self, cue_pos, target_pos, pocket_pos):
-        """
-        Calculate the cut angle in degrees.
-        This represents the difficulty of the shot.
-        """
-        ghost_pos = self._calc_ghost_ball(target_pos, pocket_pos)
-        vec1 = self._unit_vector(ghost_pos - np.array(cue_pos[:2]))
-        vec2 = self._unit_vector(np.array(pocket_pos[:2]) - np.array(target_pos[:2]))
-        
-        dot_product = np.dot(vec1, vec2)
-        angle = np.arccos(np.clip(dot_product, -1.0, 1.0)) * 180 / np.pi
-        return angle
-    
     def _geo_shot(self, cue_pos, target_pos, pocket_pos):
-        """Generate basic geometric shot parameters."""
         ghost_pos = self._calc_ghost_ball(target_pos, pocket_pos)
         direction = self._unit_vector(ghost_pos - np.array(cue_pos[:2]))
         phi = self._direction_to_degrees(direction)
-        
         dist = self._calc_dist(cue_pos, ghost_pos)
-        
-        # Adaptive power based on distance
-        if dist < 0.8:
-            V0 = min(2.0 + dist * 1.5, 7.5)
-        else:
-            V0 = min(4.0 + dist * 0.8, 7.5)
-        
-        return {
-            'V0': float(V0),
-            'phi': float(phi),
-            'theta': 0.0,
-            'a': 0.0,
-            'b': 0.0
-        }
-    
+        V0 = min(2.0 + dist * 1.5 if dist < 0.8 else 4.0 + dist * 0.8, 7.5)
+        return {'V0': float(V0), 'phi': float(phi), 'theta': 0.0, 'a': 0.0, 'b': 0.0}
+
     def _geo_bank_shot(self, cue_pos, target_pos, pocket_pos, cushion_id):
-        """
-        Generate bank shot by mirroring pocket position across cushion.
-        Uses the reflection principle for banking.
-        """
-        mirrored_pocket = np.array(pocket_pos[:2])
-        
+        """通过镜像袋口生成简单的反弹击球。"""
+        mirrored = np.array(pocket_pos[:2])
         if 'x' in cushion_id:
-            mirrored_pocket[0] = 2 * self.cushions[cushion_id] - mirrored_pocket[0]
+            mirrored[0] = 2 * self.cushions[cushion_id] - mirrored[0]
         else:
-            mirrored_pocket[1] = 2 * self.cushions[cushion_id] - mirrored_pocket[1]
-        
-        return self._geo_shot(cue_pos, target_pos, mirrored_pocket)
-    
-    # ============================================================================
-    # Target Selection and Obstruction Detection
-    # ============================================================================
+            mirrored[1] = 2 * self.cushions[cushion_id] - mirrored[1]
+        return self._geo_shot(cue_pos, target_pos, mirrored)
     
     def _count_obstructions(self, balls, from_pos, to_pos, exclude_ids=['cue']):
-        """
-        Count balls obstructing the line between two positions.
-        Uses perpendicular distance to line for detection.
-        """
         count = 0
         line_vec = np.array(to_pos[:2]) - np.array(from_pos[:2])
         line_length = np.linalg.norm(line_vec)
-        
         if line_length < 1e-6:
             return 0
-        
         line_dir = line_vec / line_length
         
         for bid, ball in balls.items():
             if bid in exclude_ids or ball.state.s == 4:
                 continue
-            
             vec_to_ball = ball.state.rvw[0][:2] - np.array(from_pos[:2])
             proj_length = np.dot(vec_to_ball, line_dir)
-            
-            # Check if ball is along the line segment
             if 0 < proj_length < line_length:
                 perp_dist = np.linalg.norm(
-                    ball.state.rvw[0][:2] - 
-                    (np.array(from_pos[:2]) + line_dir * proj_length)
+                    ball.state.rvw[0][:2] - (np.array(from_pos[:2]) + line_dir * proj_length)
                 )
-                
                 if perp_dist < self.BALL_RADIUS * 2.2:
                     count += 1
-        
         return count
     
-    def _choose_top_targets(self, balls, my_targets, table, 
-                           num_choices=3, is_defense=False):
-        """
-        Rank all possible shots by geometric favorability.
-        Returns top N shot configurations.
-        """
+    def _choose_top_targets(self, balls, my_targets, table, num_choices=1, is_defense=True):
+        """为防守策略选择目标（简化版）"""
         all_choices = []
         cue_pos = balls['cue'].state.rvw[0]
         
         for target_id in my_targets:
             if balls[target_id].state.s == 4:
                 continue
-            
             target_pos = balls[target_id].state.rvw[0]
             
-            # Evaluate direct shots to each pocket
             for pocket_id, pocket in table.pockets.items():
                 pocket_pos = pocket.center
-                
-                # Check for clear path
-                cue_to_target_clear = self._count_obstructions(
-                    balls, cue_pos, target_pos, ['cue', target_id]) == 0
-                target_to_pocket_clear = self._count_obstructions(
-                    balls, target_pos, pocket_pos, ['cue', target_id]) == 0
-                
-                if cue_to_target_clear and target_to_pocket_clear:
-                    dist = (self._calc_dist(cue_pos, target_pos) + 
-                           self._calc_dist(target_pos, pocket_pos))
-                    cut_angle = self._calculate_cut_angle(
-                        cue_pos, target_pos, pocket_pos)
-                    
-                    score = 100 - (dist * 20 + cut_angle * 0.5)
-                    
-                    # Penalize shots near the eight ball
-                    if (target_id != '8' and '8' in balls and 
-                        balls['8'].state.s != 4):
-                        eight_dist = self._calc_dist(
-                            target_pos, balls['8'].state.rvw[0])
-                        if eight_dist < 0.3:
-                            score -= (0.3 - eight_dist) * 150
-                    
+                if (self._count_obstructions(balls, cue_pos, target_pos, ['cue', target_id]) == 0 and
+                    self._count_obstructions(balls, target_pos, pocket_pos, ['cue', target_id]) == 0):
+                    dist = self._calc_dist(cue_pos, target_pos) + self._calc_dist(target_pos, pocket_pos)
+                    score = 100 - dist * 20
                     all_choices.append({
                         'type': 'direct',
                         'target_id': target_id,
                         'pocket_id': pocket_id,
                         'score': score
                     })
-                
-                # Skip bank shots in defense mode
-                if is_defense:
-                    continue
-                
-                # Evaluate bank shots
-                for cushion_id in self.cushions.keys():
-                    mirrored_pocket = np.array(pocket_pos[:2])
-                    idx = 0 if 'x' in cushion_id else 1
-                    mirrored_pocket[idx] = (2 * self.cushions[cushion_id] - 
-                                           mirrored_pocket[idx])
-                    
-                    cue_clear = self._count_obstructions(
-                        balls, cue_pos, target_pos, ['cue', target_id]) == 0
-                    bank_clear = self._count_obstructions(
-                        balls, target_pos, mirrored_pocket, 
-                        ['cue', target_id]) == 0
-                    
-                    if cue_clear and bank_clear:
-                        dist = (self._calc_dist(cue_pos, target_pos) + 
-                               self._calc_dist(target_pos, mirrored_pocket))
-                        cut_angle = self._calculate_cut_angle(
-                            cue_pos, target_pos, mirrored_pocket)
-                        
-                        score = 100 - (dist * 25 + cut_angle * 0.6 + 40)
-                        
-                        if score > 0:
-                            all_choices.append({
-                                'type': 'bank',
-                                'target_id': target_id,
-                                'pocket_id': pocket_id,
-                                'cushion_id': cushion_id,
-                                'score': score
-                            })
         
         all_choices.sort(key=lambda x: x['score'], reverse=True)
         return all_choices[:num_choices]
-    
-    # ============================================================================
-    # CMA-ES Optimization
-    # ============================================================================
-    
-    def _cma_es_optimized(self, geo_action, balls, my_targets, table,
-                         is_black_eight=False, is_opening=False):
-        """
-        Refine geometric shot using CMA-ES evolutionary optimization.
-        Searches parameter space around initial geometric solution.
-        """
-        # Define search bounds around geometric solution
-        bounds = np.array([
-            [max(0.5, geo_action['V0'] - 1.5), min(8.0, geo_action['V0'] + 1.5)],
-            [geo_action['phi'] - 15, geo_action['phi'] + 15],
-            [0, 10],
-            [-0.2, 0.2],
-            [-0.2, 0.2]
-        ])
-        
-        def normalize(x):
-            return (x - bounds[:, 0]) / (bounds[:, 1] - bounds[:, 0])
-        
-        def denormalize(x):
-            return bounds[:, 0] + x * (bounds[:, 1] - bounds[:, 0])
-        
-        # Starting point (normalized)
-        x0_norm = normalize(np.array([
-            geo_action['V0'],
-            geo_action['phi'],
-            0, 0, 0
-        ]))
-        
-        # CMA-ES options
-        opts = {
-            'bounds': [[0]*5, [1]*5],
-            'maxiter': 5 if is_black_eight else 3,
-            'popsize': 8 if is_black_eight else 6,
-            'verb_disp': 0,
-            'verb_log': 0
-        }
-        
-        def objective(x_norm):
-            """Objective function: negative average reward."""
-            x = denormalize(np.clip(x_norm, 0, 1))
-            action = {
-                'V0': float(x[0]),
-                'phi': float(x[1]),
-                'theta': float(x[2]),
-                'a': float(x[3]),
-                'b': float(x[4])
-            }
-            trials = 3 if is_black_eight else 2
-            return -self._evaluate_action(
-                action, trials, balls, my_targets, table, 10, True)
-        
+
+    def _cma_refine_action(self, action, balls, my_targets, table):
+        """使用小规模CMA-ES在局部搜索，步数和种群均受限以降低耗时。"""
         try:
-            es = cma.CMAEvolutionStrategy(x0_norm, 0.2, opts)
+            # 定义以当前动作为中心的边界
+            bounds = np.array([
+                [max(0.5, action['V0'] - 1.0), min(8.0, action['V0'] + 1.0)],
+                [(action['phi'] - 8) % 360, (action['phi'] + 8) % 360],
+                [max(0.0, action['theta'] - 3), min(90.0, action['theta'] + 3)],
+                [max(-0.5, action['a'] - 0.06), min(0.5, action['a'] + 0.06)],
+                [max(-0.5, action['b'] - 0.06), min(0.5, action['b'] + 0.06)],
+            ])
+
+            def normalize(x):
+                return (x - bounds[:, 0]) / (bounds[:, 1] - bounds[:, 0])
+
+            def denormalize(x):
+                return bounds[:, 0] + x * (bounds[:, 1] - bounds[:, 0])
+
+            # 先clip到bounds范围再normalize，避免初始点超界
+            raw_x = np.array([
+                np.clip(action['V0'], bounds[0,0], bounds[0,1]),
+                np.clip(action['phi'], bounds[1,0], bounds[1,1]),
+                np.clip(action['theta'], bounds[2,0], bounds[2,1]),
+                np.clip(action['a'], bounds[3,0], bounds[3,1]),
+                np.clip(action['b'], bounds[4,0], bounds[4,1]),
+            ])
+            x0 = normalize(raw_x)
+            x0 = np.clip(x0, 0, 1)
+
+            opts = {
+                'bounds': [[0]*5, [1]*5],
+                'maxiter': self.CMA_MAXITER,
+                'popsize': self.CMA_POPSIZE,
+                'verb_disp': 0,
+                'verb_log': 0,
+            }
+
+            def objective(x_norm):
+                x = denormalize(np.clip(x_norm, 0, 1))
+                cand = {
+                    'V0': float(x[0]),
+                    'phi': float(x[1] % 360),
+                    'theta': float(x[2]),
+                    'a': float(x[3]),
+                    'b': float(x[4]),
+                }
+                score, fatal = self._evaluate_action_safety(
+                    cand, balls, my_targets, table, num_trials=self.NET_EVAL_TRIALS
+                )
+                # 将致命率直接转化为惩罚
+                penalty = 300 * fatal
+                return -(score - penalty)
+
+            es = cma.CMAEvolutionStrategy(x0, self.CMA_SIGMA, opts)
             es.optimize(objective)
-            
+
             best_x = denormalize(np.clip(es.result.xbest, 0, 1))
-            best_action = {
+            best = {
                 'V0': float(best_x[0]),
-                'phi': float(best_x[1]),
+                'phi': float(best_x[1] % 360),
                 'theta': float(best_x[2]),
                 'a': float(best_x[3]),
-                'b': float(best_x[4])
+                'b': float(best_x[4]),
             }
-            
-            return best_action, -es.result.fbest
-            
+            best_score, best_fatal = self._evaluate_action_safety(
+                best, balls, my_targets, table, num_trials=self.NET_EVAL_TRIALS
+            )
+            return best, best_score, best_fatal
         except Exception:
-            return None, -999
+            return action, -1e9, 1.0
     
-    # ============================================================================
-    # Defensive Strategy
-    # ============================================================================
-    
-    def _get_opponent_targets(self, my_targets):
-        """Determine which balls belong to opponent."""
-        all_balls = set(str(i) for i in range(1, 16))
-        my_set = set(my_targets)
-        opponent_set = all_balls - my_set - {'8'}
-        return list(opponent_set)
-    
-    def _evaluate_safety_shot(self, action, balls, my_targets, table):
-        """
-        Evaluate defensive shot by simulating it and checking
-        opponent's best possible response. Lower score is better.
-        """
-        # Simulate our defensive shot
-        sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-        sim_table = copy.deepcopy(table)
-        shot = pt.System(table=sim_table, balls=sim_balls,
-                        cue=pt.Cue(cue_ball_id="cue"))
-        
-        shot.cue.set_state(**action)
-        
-        if not simulate_with_timeout(shot, timeout=3):
-            return 999  # Simulation failure is bad defense
-        
-        # Check if our safety shot causes a foul
-        safety_reward = analyze_shot_for_reward(shot, balls, my_targets)
-        if safety_reward < 0:
-            return 999 - safety_reward  # Fouls make it worse
-        
-        # Evaluate opponent's best shot from resulting position
-        opponent_targets = self._get_opponent_targets(my_targets)
-        opponent_choices = self._choose_top_targets(
-            shot.balls, opponent_targets, shot.table,
-            num_choices=1, is_defense=True)
-        
-        if not opponent_choices:
-            return -100  # Perfect defense - opponent has no shot
-        
-        # Return opponent's best score (we want this minimized)
-        return opponent_choices[0]['score']
+    def _local_optimize_action(self, action, balls, my_targets, table):
+            """在网络输出附近做极小范围扰动微调，减少额外决策时间。"""
+            candidates = [action]
+
+            # 生成对称扰动
+            for _ in range(self.LOCAL_PERTURB_STEPS):
+                perturbed = dict(action)
+                for k, scale in self.LOCAL_PERTURB_SCALE.items():
+                    noise = np.random.randn() * scale
+                    if k == 'phi':
+                        perturbed[k] = (perturbed[k] + noise) % 360
+                    else:
+                        perturbed[k] = perturbed[k] + noise
+
+                # 边界裁剪
+                perturbed['V0'] = float(np.clip(perturbed['V0'], 0.5, 8.0))
+                perturbed['theta'] = float(np.clip(perturbed['theta'], 0, 90))
+                perturbed['a'] = float(np.clip(perturbed['a'], -0.5, 0.5))
+                perturbed['b'] = float(np.clip(perturbed['b'], -0.5, 0.5))
+                candidates.append(perturbed)
+
+            best = action
+            best_score, best_fatal = self._evaluate_action_safety(
+                best, balls, my_targets, table, num_trials=1
+            )
+
+            for cand in candidates[1:]:
+                score, fatal = self._evaluate_action_safety(
+                    cand, balls, my_targets, table, num_trials=1
+                )
+                if fatal <= self.FATAL_RATE_THRESHOLD and (fatal < best_fatal or score > best_score):
+                    best, best_score, best_fatal = cand, score, fatal
+
+            return best, best_score, best_fatal
     
     def _find_best_safety_shot(self, balls, my_targets, table):
-        """
-        Generate and evaluate multiple defensive strategies.
-        Returns the action that minimizes opponent's opportunities.
-        """
-        print("[Agent] Switching to defensive play - generating safety shots")
+        """生成防守性击球"""
+        print("[NeuralAgent] Attempting defensive safety shot...")
         
-        candidate_safeties = []
         cue_pos = balls['cue'].state.rvw[0]
+        candidate_safeties = []
         
-        # Strategy 1: Hide cue ball behind our own balls
+        # Strategy 1: 轻推白球到安全位置
+        for angle in [0, 45, 90, 135, 180, 225, 270, 315]:
+            rad = angle * np.pi / 180
+            direction = np.array([np.cos(rad), np.sin(rad)])
+            phi = self._direction_to_degrees(direction)
+            action = {'V0': 0.8, 'phi': phi, 'theta': 0, 'a': 0, 'b': 0}
+            candidate_safeties.append(action)
+        
+        # Strategy 2: 推自己的球到边缘
         for my_ball_id in my_targets:
-            if balls[my_ball_id].state.s == 4:
+            if my_ball_id == '8' or balls[my_ball_id].state.s == 4:
                 continue
             
             my_ball_pos = balls[my_ball_id].state.rvw[0]
             
-            # Try hiding in multiple directions
-            for angle_deg in [0, 90, 180, 270]:
-                rad = angle_deg * np.pi / 180
-                # Position behind our ball
-                hide_target = my_ball_pos[:2] + np.array([
-                    np.cos(rad), np.sin(rad)
-                ]) * (self.BALL_RADIUS * 3)
-                
-                direction = self._unit_vector(hide_target - cue_pos[:2])
-                phi = self._direction_to_degrees(direction)
-                
-                candidate_safeties.append({
-                    'V0': 0.8,
-                    'phi': phi,
-                    'theta': 0,
-                    'a': 0,
-                    'b': 0
-                })
-        
-        # Strategy 2: Gently nudge our ball to the rail
-        for my_ball_id in my_targets:
-            if balls[my_ball_id].state.s == 4:
-                continue
-            
-            my_ball_pos = balls[my_ball_id].state.rvw[0]
-            
-            # Find nearest rail
-            nearest_dist = float('inf')
-            target_rail = None
-            
+            # 找最近的cushion
             for cushion_name, cushion_val in self.cushions.items():
                 if 'x' in cushion_name:
-                    dist = abs(my_ball_pos[0] - cushion_val)
-                    if dist < nearest_dist:
-                        nearest_dist = dist
-                        target_rail = [cushion_val, my_ball_pos[1]]
+                    target_pos = [cushion_val, my_ball_pos[1]]
                 else:
-                    dist = abs(my_ball_pos[1] - cushion_val)
-                    if dist < nearest_dist:
-                        nearest_dist = dist
-                        target_rail = [my_ball_pos[0], cushion_val]
-            
-            if target_rail:
-                action = self._geo_shot(cue_pos, my_ball_pos, target_rail)
-                action['V0'] = 1.0  # Low power push
+                    target_pos = [my_ball_pos[0], cushion_val]
+                
+                action = self._geo_shot(cue_pos, my_ball_pos, target_pos)
+                action['V0'] = 1.2  # 低力度
                 candidate_safeties.append(action)
         
         if not candidate_safeties:
             return self._safe_action()
         
-        # Evaluate all safety candidates
-        best_safety = None
-        lowest_opp_score = float('inf')
-        
+        # 简单评估：选择第一个不会犯规的
         for action in candidate_safeties:
-            opp_score = self._evaluate_safety_shot(
-                action, balls, my_targets, table)
-            
-            if opp_score < lowest_opp_score:
-                lowest_opp_score = opp_score
-                best_safety = action
+            avg_score, fatal_rate = self._evaluate_action_safety(
+                action, balls, my_targets, table, num_trials=5
+            )
+            if avg_score > -50 and fatal_rate < 0.3:
+                print(f"[NeuralAgent] Using safety shot with score={avg_score:.1f}")
+                return action
         
-        print(f"[Agent] Defense selected - opponent's best reply "
-              f"estimated at {lowest_opp_score:.1f}")
-        
-        return best_safety
+        print("[NeuralAgent] No good safety shot found, using safe action")
+        return self._safe_action()
     
-    # ============================================================================
-    # Main Decision Logic
-    # ============================================================================
+    # ==================== Main Decision Logic ====================
     
     def decision(self, balls=None, my_targets=None, table=None):
         if not all([balls, my_targets, table]):
             return self._safe_action()
         
         try:
-            # Determine game state
-            remaining = [bid for bid in my_targets if balls[bid].state.s != 4]
+            # 检查是否需要打黑8
+            remaining = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
             if not remaining and "8" in balls and balls["8"].state.s != 4:
                 my_targets = ['8']
-                print("[NewAgent] Switching to black eight")
+                print("[NeuralAgent] Switching to black eight")
+            
+            # 如果模型没有加载成功，返回安全动作
+            if self.model is None:
+                print("[NeuralAgent] Model not loaded")
+                return self._safe_action()
+            
+            # 1. 使用神经网络生成多个候选动作，然后用轻量仿真筛选
             is_black_eight = (my_targets == ['8'])
+            score_threshold = self.SCORE_THRESHOLD_EIGHT if is_black_eight else self.SCORE_THRESHOLD_NORMAL
 
-            # Define thresholds
-            GEO_THRESHOLD = 70 if is_black_eight else 55
-            SCORE_THRESHOLD = 60 if is_black_eight else 45
-            SAFE_FATAL_THRESHOLD = 0.05
-            PRE_TRIALS = 5
+            with torch.no_grad():
+                state_features = self._extract_state_features(balls, my_targets)
+                normalized_outputs = self.model(state_features)  # [1, K, 6]
 
-            # Layer 1: Select Best Targets
-            top_choices = self._choose_top_targets(balls, my_targets, table, num_choices=3)
-            
-            if not top_choices:
-                return self._find_best_safety_shot(balls, my_targets, table)
+            candidates = []
+            for k in range(normalized_outputs.shape[1]):
+                cand_norm = normalized_outputs[0, k].cpu().numpy()
+                cand_action = self._denormalize_action(cand_norm)
+                # 只评估一次分数和致命率
+                score, fatal = self._evaluate_action_safety(
+                    cand_action, balls, my_targets, table, num_trials=1
+                )
+                candidates.append((cand_action, score, fatal, f"net-{k}"))
 
-            # Layer 2 & 3: Evaluate Geometric shots and Optimize
-            all_evaluated = []
-            cue_pos = balls['cue'].state.rvw[0]
+            # 选分数最高且致命率合格的
+            best_action = None
+            best_score = -1e9
+            best_fatal = 1.0
+            for cand_action, score, fatal, name in candidates:
+                if fatal <= self.FATAL_RATE_THRESHOLD and score > best_score:
+                    best_action = cand_action
+                    best_score = score
+                    best_fatal = fatal
 
-            for choice in top_choices:
-                # Generate base action
-                target_pos = balls[choice['target_id']].state.rvw[0]
-                pocket_pos = table.pockets[choice['pocket_id']].center
-                base_action = self._geo_bank_shot(cue_pos, target_pos, pocket_pos, choice['cushion_id']) if choice['type'] == 'bank' else self._geo_shot(cue_pos, target_pos, pocket_pos)
+                    if best_score >= score_threshold:
+                     print(f"[NeuralAgent] ✓ Selected action from network: score={best_score:.2f}, fatal_rate={best_fatal:.1%}")
+                     return best_action
+
+            # 如果没有任何合格动作，退而求其次，选分数最高的
+            if best_action is None and candidates:
+                best_action, best_score, best_fatal, _ = max(candidates, key=lambda x: x[1])
+
+            # 3a. 局部扰动微调（替代CMA-ES）
+            if self.USE_LOCAL:
+                print("[NeuralAgent] Performing local optimization...")
+                opt_action, opt_score, opt_fatal = self._local_optimize_action(
+                    best_action, balls, my_targets, table
+                )
                 
-                # Quick check on geometric action
-                geo_score = self._evaluate_action(base_action, PRE_TRIALS, balls, my_targets, table, 20, True)
+                opt_score, opt_fatal = self._evaluate_action_safety(
+                    opt_action, balls, my_targets, table, num_trials=5)
                 
-                action_to_check, score_to_check = base_action, geo_score
-
-                # If geo score is not great, try to optimize
-                if geo_score < GEO_THRESHOLD:
-                    opt_action, opt_score = self._cma_es_optimized(base_action, balls, my_targets, table, is_black_eight)
-                    if opt_action and opt_score > geo_score:
-                        action_to_check, score_to_check = opt_action, opt_score
-
-                # Safety check
-                fatal_rate, _, verified_score = self._check_fatal_failure(action_to_check, balls, my_targets, table, num_trials=15)
-                
-                shot_type_str = f"{choice['type']} {choice['target_id']}->{choice['pocket_id']}"
-                print(f"[NewAgent] > Evaluated {shot_type_str}: score={verified_score:.2f}, fatal_rate={fatal_rate:.1%}")
-                all_evaluated.append((action_to_check, verified_score, shot_type_str, fatal_rate))
-
-                if verified_score >= SCORE_THRESHOLD and fatal_rate <= SAFE_FATAL_THRESHOLD:
-                    print(f"[NewAgent] ✓ Found acceptable action early.")
-                    return action_to_check
+                if opt_fatal <= self.FATAL_RATE_THRESHOLD and opt_score > 0:
+                    print(f"[NeuralAgent] ✓ Local optimization improved action:\n    V0={best_action['V0']:.2f}, phi={best_action['phi']:.2f}, theta={best_action['theta']:.2f}, a={best_action['a']:.2f}, b={best_action['b']:.2f}\n ->V0={opt_action['V0']:.2f}, phi={opt_action['phi']:.2f}, theta={opt_action['theta']:.2f}, a={opt_action['a']:.2f}, b={opt_action['b']:.2f}\n score={opt_score:.2f}, fatal_rate={opt_fatal:.1%}")
+                    return opt_action
             
-            # Layer 4: Fallback Selection (Offensive)
-            safe_candidates = [cand for cand in all_evaluated if cand[3] <= SAFE_FATAL_THRESHOLD]
-            
-            if safe_candidates:
-                best_action, best_score, best_type, _ = max(safe_candidates, key=lambda x: x[1])
-                
-                if best_score > 10: # Only take the shot if it's reasonably good
-                    print(f"[NewAgent] Using best safe option: {best_type} (score={best_score:.2f})")
-                    return best_action
-
-            # Final Fallback: Switch to Defensive Strategy
-            return self._find_best_safety_shot(balls, my_targets, table)
-            
+            print("[NeuralAgent] No acceptable action found, reduced to safe strategy.")
+            return self._safe_action()
         except Exception as e:
-            print(f"[NewAgent] Decision failed: {e}")
+            print(f"[NeuralAgent] Error: {e}")
             import traceback
             traceback.print_exc()
             return self._safe_action()
+
