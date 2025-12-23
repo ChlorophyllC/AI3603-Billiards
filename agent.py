@@ -401,16 +401,75 @@ class ImitationDataCollector:
                        table,
                        chosen_action,      # Teacher选择的动作
                        action_score,       # 该动作的评估分数
-                       game_result=None):  # 最终游戏结果（可选）
+                       trial_results=None, # _check_fatal_failure 的详细试验结果
+                       all_candidates=None,# 所有候选动作
+                       game_result=None,   # 最终游戏结果（可选）
+                       geo_params=None,    # 原始几何参数
+                       is_optimized=False):# 是否经过优化
         """
         记录一次完整的决策
         
-        关键：记录整个球桌状态 + Teacher的最优选择
+        参数：
+            trial_results: list, 来自 _check_fatal_failure 的详细试验结果
+            all_candidates: list, [(action, score, shot_type, fatal_rate, geo_params, is_opt), ...] 所有候选动作
+            geo_params: dict, 原始几何参数 {'V0', 'phi', 'theta', 'a', 'b'}
+            is_optimized: bool, 是否经过优化
         """
         
         # === 提取状态特征 ===
         state_features = self._extract_state_features(
             balls, my_targets, table)
+        
+        # === 分析试验结果统计 ===
+        trial_stats = self._analyze_trial_results(trial_results) if trial_results else {}
+        
+        # === 分析候选动作 ===
+        candidates_data = []
+        if all_candidates:
+            for item in all_candidates:
+                # 支持两种格式：
+                # 新格式 (6元): (action, score, shot_info, fatal_rate, geo_params, is_opt)
+                # 旧格式 (4元): (action, score, shot_info, fatal_rate)
+                if len(item) == 6:
+                    action, score, shot_info, fatal_rate, geo_params, is_opt = item
+                else:
+                    action, score, shot_info, fatal_rate = item
+                    geo_params = None
+                    is_opt = False
+                
+                # shot_info 是字典：{'type': 'direct', 'target_id': '9', 'pocket_id': 'rb'}
+                if isinstance(shot_info, str):
+                    # 兼容旧格式（如果还有字符串）
+                    candidate_entry = {
+                        "shot_type_string": shot_info,  # 保留原始字符串
+                        "score": float(score),
+                        "fatal_rate": float(fatal_rate),
+                        "is_chosen": (action == chosen_action)
+                    }
+                else:
+                    # 新格式：拆解为结构化字段
+                    candidate_entry = {
+                        "shot_type": shot_info.get('type', 'unknown'),
+                        "target_ball": shot_info.get('target_id', ''),
+                        "target_pocket": shot_info.get('pocket_id', ''),
+                        "score": float(score),
+                        "fatal_rate": float(fatal_rate),
+                        "is_chosen": (action == chosen_action)
+                    }
+                
+                # ✅ 添加几何参数和优化标记
+                if geo_params:
+                    candidate_entry["geometric_params"] = {
+                        'V0': float(geo_params['V0']),
+                        'phi': float(geo_params['phi']),
+                        'theta': float(geo_params['theta']),
+                        'a': float(geo_params['a']),
+                        'b': float(geo_params['b'])
+                    }
+                
+                candidate_entry["is_optimized"] = bool(is_opt)
+                
+                candidates_data.append(candidate_entry)
         
         # === 构造训练样本 ===
         sample = {
@@ -429,9 +488,19 @@ class ImitationDataCollector:
                 'b': float(chosen_action['b'])
             },
             
+            # ✅ 添加几何参数和优化标记
+            'action_geometry': geo_params if geo_params else None,
+            'action_was_optimized': is_optimized,
+            
             # 质量指标
             'action_score': float(action_score),
             'is_high_quality': action_score >= 60,  # 只学习高质量决策
+            
+            # 试验统计（详细数据）
+            'trial_statistics': trial_stats,
+            
+            # 候选动作对比
+            'candidates_considered': candidates_data,
             
             # 元信息
             'is_eight_ball': (my_targets == ['8']),
@@ -445,6 +514,82 @@ class ImitationDataCollector:
             self.save_session()
         
         return sample
+    
+    def _analyze_trial_results(self, trial_results):
+        """
+        分析 _check_fatal_failure 的试验结果
+        
+        关键定义：
+        - success: 没有犯规 + 成功进球
+        - fatal: 致命失败（白球入袋、误打黑8等）
+        - foul: 其他犯规（首球犯规、库犯规等）
+        - error: 模拟异常
+        - timeout: 不计入（已在 _check_fatal_failure 中过滤）
+        """
+        if not trial_results:
+            return {}
+        
+        stats = {
+            "total_trials": len(trial_results),
+            "success_trials": 0,      # 成功进球（无犯规）
+            "fatal_trials": 0,        # 致命失败
+            "foul_trials": 0,         # 其他犯规
+            "error_trials": 0,        # 模拟异常
+            "scores": [],
+            "ball_pocket_mapping": {},  # 球->袋子 映射
+            "foul_types_count": {}
+        }
+        
+        for trial in trial_results:
+            if trial.get("error"):
+                stats["error_trials"] += 1
+            elif trial.get("fatal"):
+                stats["fatal_trials"] += 1
+                # 统计犯规类型
+                if trial.get("fouls"):
+                    for foul_type in trial["fouls"]:
+                        if foul_type not in stats["foul_types_count"]:
+                            stats["foul_types_count"][foul_type] = 0
+                        stats["foul_types_count"][foul_type] += 1
+            elif trial.get("success"):
+                stats["success_trials"] += 1
+                
+                # 记录分数
+                if trial.get("score", -999) != -999:
+                    stats["scores"].append(trial["score"])
+                
+                # 记录进球的球->袋子映射
+                pocketed_detail = trial.get("balls_pocketed_detail", {})
+                for ball_id, pocket_id in pocketed_detail.items():
+                    key = f"{ball_id}->{pocket_id}"
+                    if key not in stats["ball_pocket_mapping"]:
+                        stats["ball_pocket_mapping"][key] = 0
+                    stats["ball_pocket_mapping"][key] += 1
+            else:
+                # 其他犯规（有 fouls 但不是 fatal/success/error）
+                stats["foul_trials"] += 1
+                if trial.get("fouls"):
+                    for foul_type in trial["fouls"]:
+                        if foul_type not in stats["foul_types_count"]:
+                            stats["foul_types_count"][foul_type] = 0
+                        stats["foul_types_count"][foul_type] += 1
+        
+        # 计算比率
+        valid_trials = stats["success_trials"] + stats["fatal_trials"] + stats["foul_trials"]
+        if valid_trials > 0:
+            stats["success_rate"] = stats["success_trials"] / valid_trials
+            stats["fatal_rate"] = stats["fatal_trials"] / valid_trials
+            stats["foul_rate"] = stats["foul_trials"] / valid_trials
+            stats["average_score"] = float(np.mean(stats["scores"])) if stats["scores"] else -999
+        else:
+            stats["success_rate"] = 0.0
+            stats["fatal_rate"] = 1.0
+            stats["foul_rate"] = 0.0
+            stats["average_score"] = -999
+        
+        stats["scores"].clear()
+        
+        return stats
     
     def _extract_state_features(self, balls, my_targets, table):
         """
@@ -721,17 +866,45 @@ class NewAgent(Agent):
                             num_trials=10, fatal_threshold=0.1):
         """
         Check for catastrophic outcomes (scratching eight ball, etc.).
-        Returns (fatal_rate, fatal_count, avg_score).
+        
+        定义清晰的试验状态：
+        - success: 模拟成功 + 没有犯规 + 成功击球入袋
+        - fatal: 模拟成功，但有致命失败（白球入袋、误打黑8等）
+        - foul: 模拟成功，但有犯规（首球犯规、库犯规等）
+        - error: 模拟异常（超时、异常）
+        
+        模拟超时不计入 trial_results（直接跳过，不浪费数据空间）
+        
+        Returns:
+            fatal_rate: float, 致命失败率 = fatal_count / (总有效试验 - error_count)
+            fatal_count: int, 致命失败次数
+            avg_score: float, 平均分数
+            trial_results: list, 有效的试验结果（不包含超时）
         """
         targeting_eight = (my_targets == ['8'])
         fatal_count = 0
+        foul_count = 0
+        success_count = 0
         error_count = 0
         scores = []
+        trial_results = []
+        completed_trials = 0
         
-        for trial in range(num_trials):
+        while completed_trials < num_trials:
+            trial_result = {
+                "trial_num": completed_trials + 1,
+                "success": False,
+                "score": -999,
+                "balls_pocketed": [],
+                "balls_pocketed_detail": {},
+                "fouls": [],
+                "fatal": False,
+                "error": None
+            }
+            
             try:
                 # Early termination if fatal rate is already too high
-                if fatal_count / (trial + 1) > fatal_threshold + 0.1:
+                if completed_trials > 0 and fatal_count / completed_trials > fatal_threshold + 0.1:
                     break
                 
                 # Simulate with noise
@@ -756,33 +929,120 @@ class NewAgent(Agent):
                     b=np.clip(b, -0.5, 0.5)
                 )
                 
+                # 模拟超时直接跳过，不计入 trial_results
                 if not simulate_with_timeout(shot, timeout=3):
-                    error_count += 1
-                    continue
+                    continue  # ← 直接跳过，不计数
                 
-                scores.append(self._improved_reward_function(
-                    shot, balls, my_targets, sim_table))
+                trial_score = self._improved_reward_function(
+                    shot, balls, my_targets, sim_table)
+                scores.append(trial_score)
+                trial_result["score"] = float(trial_score)
                 
-                # Check for fatal outcomes
+                # Check for balls pocketed (with pocket info)
                 new_pocketed = [bid for bid, ball in shot.balls.items()
                                if ball.state.s == 4 and balls[bid].state.s != 4]
                 
-                if "cue" in new_pocketed and "8" in new_pocketed:
+                # 提取进球的详细信息：球ID -> 袋子
+                balls_pocketed_detail = {}
+                for e in shot.events:
+                    et = str(e.event_type).lower()
+                    ids = list(e.ids) if hasattr(e, 'ids') else []
+                    if 'pocket' in et and len(ids) >= 2:
+                        ball_id = ids[0]
+                        pocket_id = ids[1]
+                        if ball_id in new_pocketed:
+                            balls_pocketed_detail[ball_id] = pocket_id
+                
+                trial_result["balls_pocketed"] = new_pocketed
+                trial_result["balls_pocketed_detail"] = balls_pocketed_detail
+                
+                # Analyze fouls
+                foul_types = []
+                cue_pocketed = "cue" in new_pocketed
+                eight_pocketed = "8" in new_pocketed
+                
+                # 检查致命失败（白球+黑8 或 误打黑8）
+                is_fatal = False
+                if cue_pocketed and eight_pocketed:
+                    foul_types.append("cue_and_eight_pocketed")
+                    is_fatal = True
+                elif cue_pocketed:
+                    foul_types.append("cue_pocketed")
+                elif eight_pocketed and not targeting_eight:
+                    foul_types.append("eight_pocketed_early")
+                    is_fatal = True
+                
+                # Check first ball contact
+                first_contact_ball_id = None
+                valid_ball_ids = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'}
+                for e in shot.events:
+                    et = str(e.event_type).lower()
+                    ids = list(e.ids) if hasattr(e, 'ids') else []
+                    if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
+                        other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
+                        if other_ids:
+                            first_contact_ball_id = other_ids[0]
+                            break
+                
+                if first_contact_ball_id is None:
+                    if len(balls) > 2 or my_targets != ['8']:
+                        foul_types.append("no_ball_contact")
+                elif first_contact_ball_id not in my_targets:
+                    foul_types.append(f"illegal_first_contact({first_contact_ball_id})")
+                
+                # Check rail contact
+                cue_hit_cushion = False
+                target_hit_cushion = False
+                for e in shot.events:
+                    et = str(e.event_type).lower()
+                    ids = list(e.ids) if hasattr(e, 'ids') else []
+                    if 'cushion' in et:
+                        if 'cue' in ids:
+                            cue_hit_cushion = True
+                        if first_contact_ball_id and first_contact_ball_id in ids:
+                            target_hit_cushion = True
+                
+                if len(new_pocketed) == 0 and first_contact_ball_id and not cue_hit_cushion and not target_hit_cushion:
+                    foul_types.append("no_rail_contact")
+                
+                trial_result["fouls"] = foul_types
+                
+                # ✅ 关键定义：success = 没有犯规 + 有进球
+                if not foul_types and len(new_pocketed) > 0:
+                    trial_result["success"] = True
+                    success_count += 1
+                elif is_fatal:
+                    # 致命失败不算 success
+                    trial_result["fatal"] = True
                     fatal_count += 1
-                elif "8" in new_pocketed and not targeting_eight:
-                    fatal_count += 1
+                elif foul_types:
+                    # 普通犯规也不算 success
+                    foul_count += 1
+                
+                trial_results.append(trial_result)
+                completed_trials += 1
                     
-            except Exception:
+            except Exception as e:
+                trial_result["error"] = f"exception:{str(e)[:50]}"
                 error_count += 1
+                trial_results.append(trial_result)
+                completed_trials += 1
         
-        success_count = num_trials - error_count
-        if success_count == 0:
-            return 1.0, num_trials, -999
+        # 计算比率（基于实际完成的有效试验）
+        total_valid = completed_trials
+        if total_valid == 0:
+            return 1.0, 0, -999, trial_results
         
-        fatal_rate = fatal_count / success_count
+        # fatal_rate = 致命失败 / (完成的试验 - 错误)
+        valid_count = total_valid - error_count
+        if valid_count > 0:
+            fatal_rate = fatal_count / valid_count
+        else:
+            fatal_rate = 1.0
+        
         avg_score = float(np.mean(scores)) if scores else -500
         
-        return fatal_rate, fatal_count, avg_score
+        return fatal_rate, fatal_count, avg_score, trial_results
     
     # ============================================================================
     # Geometric Shot Calculations
@@ -1199,6 +1459,7 @@ class NewAgent(Agent):
 
             # Layer 2 & 3: Evaluate Geometric shots and Optimize
             all_evaluated = []
+            trial_results_map = {}  # ✅ 映射 shot_info -> trial_results
             cue_pos = balls['cue'].state.rvw[0]
 
             for choice in top_choices:
@@ -1207,23 +1468,39 @@ class NewAgent(Agent):
                 pocket_pos = table.pockets[choice['pocket_id']].center
                 base_action = self._geo_bank_shot(cue_pos, target_pos, pocket_pos, choice['cushion_id']) if choice['type'] == 'bank' else self._geo_shot(cue_pos, target_pos, pocket_pos)
                 
+                # ✅ 保存几何参数
+                geo_params = copy.deepcopy(base_action)
+                
                 # Quick check on geometric action
                 geo_score = self._evaluate_action(base_action, PRE_TRIALS, balls, my_targets, table, 20, True)
                 
                 action_to_check, score_to_check = base_action, geo_score
+                was_optimized = False
 
                 # If geo score is not great, try to optimize
                 if geo_score < GEO_THRESHOLD:
                     opt_action, opt_score = self._cma_es_optimized(base_action, balls, my_targets, table, is_black_eight)
                     if opt_action and opt_score > geo_score:
                         action_to_check, score_to_check = opt_action, opt_score
+                        was_optimized = True
 
-                # Safety check
-                fatal_rate, _, verified_score = self._check_fatal_failure(action_to_check, balls, my_targets, table, num_trials=15)
+                # Safety check with detailed trial results
+                fatal_rate, fatal_count, verified_score, trial_results = self._check_fatal_failure(
+                    action_to_check, balls, my_targets, table, num_trials=15)
                 
-                shot_type_str = f"{choice['type']} {choice['target_id']}->{choice['pocket_id']}"
-                print(f"[NewAgent] > Evaluated {shot_type_str}: score={verified_score:.2f}, fatal_rate={fatal_rate:.1%}")
-                all_evaluated.append((action_to_check, verified_score, shot_type_str, fatal_rate))
+                # 构建结构化的 shot_info
+                shot_info = {
+                    'type': choice['type'],
+                    'target_id': choice['target_id'],
+                    'pocket_id': choice['pocket_id']
+                }
+                
+                # ✅ 存储 trial_results 映射
+                shot_key = (choice['type'], choice['target_id'], choice['pocket_id'])
+                trial_results_map[shot_key] = trial_results
+                
+                print(f"[NewAgent] > Evaluated {choice['type']} {choice['target_id']}->{choice['pocket_id']}: score={verified_score:.2f}, fatal_rate={fatal_rate:.1%}, optimized={was_optimized}")
+                all_evaluated.append((action_to_check, verified_score, shot_info, fatal_rate, geo_params, was_optimized))
 
                 if verified_score >= SCORE_THRESHOLD and fatal_rate <= SAFE_FATAL_THRESHOLD:
                     print(f"[NewAgent] ✓ Found acceptable action early.")
@@ -1234,18 +1511,28 @@ class NewAgent(Agent):
                             my_targets=my_targets,
                             table=table,
                             chosen_action=action_to_check,
-                            action_score=verified_score
+                            action_score=verified_score,
+                            trial_results=trial_results,
+                            all_candidates=all_evaluated,
+                            geo_params=geo_params,
+                            is_optimized=was_optimized
                         )
                     return action_to_check
             
             # Layer 4: Fallback Selection (Offensive)
-            safe_candidates = [cand for cand in all_evaluated if cand[3] <= SAFE_FATAL_THRESHOLD]
+            safe_candidates = [(act, sc, shot_inf, fr, geo, opt) for act, sc, shot_inf, fr, geo, opt in all_evaluated 
+                              if fr <= SAFE_FATAL_THRESHOLD]
             
             if safe_candidates:
-                best_action, best_score, best_type, _ = max(safe_candidates, key=lambda x: x[1])
+                best_candidate = max(safe_candidates, key=lambda x: x[1])
+                best_action, best_score, best_shot_info, _, best_geo_params, best_was_optimized = best_candidate
                 
                 if best_score > 10: # Only take the shot if it's reasonably good
-                    print(f"[NewAgent] Using best safe option: {best_type} (score={best_score:.2f})")
+                    # ✅ 从映射中获取 trial_results
+                    shot_key = (best_shot_info['type'], best_shot_info['target_id'], best_shot_info['pocket_id'])
+                    best_trial_results = trial_results_map.get(shot_key, [])
+                    
+                    print(f"[NewAgent] Using best safe option: {best_shot_info['type']} {best_shot_info['target_id']}->{best_shot_info['pocket_id']} (score={best_score:.2f})")
 
                     if self.collect_imitation_data:
                         self.imitation_collector.record_decision(
@@ -1253,7 +1540,11 @@ class NewAgent(Agent):
                             my_targets=my_targets,
                             table=table,
                             chosen_action=best_action,
-                            action_score=best_score
+                            action_score=best_score,
+                            trial_results=best_trial_results,
+                            all_candidates=all_evaluated,
+                            geo_params=best_geo_params,
+                            is_optimized=best_was_optimized
                         )
 
                     return best_action
