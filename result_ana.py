@@ -14,10 +14,13 @@ class GameLog:
         self.player_a_agent = None
         self.player_b_agent = None
         self.player_a_target = None
-        self.shots = []  # [(shot_number, player, timestamp), ...]
+        self.shots = []  # [[shot_number, player, timestamp, pocketed_balls], ...]
         self.winner = None
         self.duration = None
         self.opponent_ball_pocketed = []  # 对方球入袋事件
+        self.agent_a_remaining = None
+        self.agent_b_remaining = None
+        self.strategies = {}  # 策略记录
         
     def get_agent_for_player(self, player):
         """根据Player获取对应的Agent名称"""
@@ -26,6 +29,14 @@ class GameLog:
         elif player == 'B':
             return self.player_b_agent
         return None
+    
+    def get_game_duration(self):
+        """计算本局从第一次击球到最后一次击球的时间"""
+        if len(self.shots) < 2:
+            return 0
+        first_shot_time = self.shots[0][2]
+        last_shot_time = self.shots[-1][2]
+        return (last_shot_time - first_shot_time).total_seconds()
 
 
 class LogAnalyzer:
@@ -48,65 +59,102 @@ class LogAnalyzer:
             line = line.strip()
             if not line:
                 continue
-            
             # 提取时间戳
-            timestamp_match = re.match(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
+            timestamp_match = re.match(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{3})?)', line)
             if timestamp_match:
                 timestamp_str = timestamp_match.group(1)
-                last_timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                if '.' in timestamp_str:
+                    last_timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S.%f')
+                else:
+                    last_timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
                 content = line[len(timestamp_str):].strip(' -')
             else:
                 content = line
-            
+
             # 解析Agent名称（全局信息）- 只在开始评估时解析，避免匹配到战绩统计行
             if '开始对战评估' in content or ('Agent A:' in content and 'Agent B:' in content and '累计战绩' not in content and '局结果' not in content):
                 match = re.search(r'Agent A:\s*(\w+),\s*Agent B:\s*(\w+)', content)
-                if match and not self.agent_a_name:  # 只设置一次
+                if match and not self.agent_a_name:
                     self.agent_a_name = match.group(1)
                     self.agent_b_name = match.group(2)
-            
+                    for game in self.games:
+                        if not game.strategies:
+                            game.strategies = {self.agent_a_name: [], self.agent_b_name: []}
+                    if current_game and not current_game.strategies:
+                        current_game.strategies = {self.agent_a_name: [], self.agent_b_name: []}
+
             # 新局开始
             if '局比赛开始' in content:
                 match = re.search(r'第\s*(\d+)\s*局比赛开始', content)
                 if match:
                     current_game = GameLog()
                     current_game.game_number = int(match.group(1))
-            
+                    if self.agent_a_name and self.agent_b_name:
+                        current_game.strategies = {self.agent_a_name: [], self.agent_b_name: []}
+                    else:
+                        current_game.strategies = {}
+
             # 本局Player和Agent映射
             if current_game and '本局 Player A:' in content:
                 match = re.search(r'Player A:\s*(\w+),\s*目标球型:\s*(\w+)', content)
                 if match:
                     current_game.player_a_agent = match.group(1)
                     current_game.player_a_target = match.group(2)
-                    # 推断Player B的Agent
                     if current_game.player_a_agent == self.agent_a_name:
                         current_game.player_b_agent = self.agent_b_name
                     else:
                         current_game.player_b_agent = self.agent_a_name
-            
+
             # 击球记录
-            if current_game and '次击球' in content:
-                match = re.search(r'\[第(\d+)次击球\]\s*player:\s*([AB])', content)
+            if current_game and re.match(r'\[第\d+次击球\] player: [AB]', content):
+                match = re.match(r'\[第(\d+)次击球\] player: ([AB])', content)
                 if match and last_timestamp:
                     shot_number = int(match.group(1))
                     player = match.group(2)
-                    current_game.shots.append((shot_number, player, last_timestamp))
-            
-            # 对方球入袋
-            if current_game and '对方球入袋' in content:
-                current_game.opponent_ball_pocketed.append(last_timestamp)
-            
+                    current_game.shots.append([shot_number, player, last_timestamp, [], []])  # [shot_number, player, timestamp, my_pocketed, opp_pocketed]
+
+            # 策略记录
+            if current_game and 'NewAgent 策略:' in content:
+                match = re.search(r'NewAgent 策略:\s*(\w+)', content)
+                if match:
+                    strategy = match.group(1)
+                    if current_game.player_a_agent == 'NewAgent':
+                        current_game.strategies.setdefault('NewAgent', []).append(strategy)
+                    elif current_game.player_b_agent == 'NewAgent':
+                        current_game.strategies.setdefault('NewAgent', []).append(strategy)
+
+            # 进球记录
+            if current_game and '本杆进球' in content:
+                match = re.search(r'本杆进球 \((\w+)\) - 我方: (\[.*?\]), 对方: (\[.*?\])', content)
+                if match:
+                    agent = match.group(1)
+                    try:
+                        my_balls = eval(match.group(2))
+                        opp_balls = eval(match.group(3))
+                    except Exception:
+                        my_balls = []
+                        opp_balls = []
+                    if current_game.shots:
+                        current_game.shots[-1][3] = my_balls
+                        current_game.shots[-1][4] = opp_balls
+
+            # 结束时剩余球数
+            if current_game and '结束时剩余球数' in content:
+                match = re.search(r'Agent A:\s*(\d+),\s*Agent B:\s*(\d+)', content)
+                if match:
+                    current_game.agent_a_remaining = int(match.group(1))
+                    current_game.agent_b_remaining = int(match.group(2))
+
             # 局结果 - 这里的Agent A/B指的是全局Agent
             if current_game and '局结果' in content:
                 match = re.search(r'Agent ([AB])\s*获胜', content)
                 if match:
-                    winner_label = match.group(1)  # 'A' 或 'B'
-                    # 全局的Agent A/B
+                    winner_label = match.group(1)
                     if winner_label == 'A':
                         current_game.winner = self.agent_a_name
                     else:
                         current_game.winner = self.agent_b_name
-            
+
             # 本局耗时
             if current_game and '本局耗时' in content:
                 match = re.search(r'本局耗时:\s*([\d.]+)s', content)
@@ -115,6 +163,143 @@ class LogAnalyzer:
                     self.games.append(current_game)
                     current_game = None
     
+    def _analyze_strategy_ratio(self):
+        """分析 NewAgent 策略占比"""
+        print("\n" + "-"*80)
+        print("11. NewAgent 策略占比分析")
+        print("-"*80)
+        
+        strategy_counts = defaultdict(int)
+        total_decisions = 0
+        
+        for game in self.games:
+            for agent, strategies in game.strategies.items():
+                if agent == 'NewAgent':
+                    for strategy in strategies:
+                        strategy_counts[strategy] += 1
+                        total_decisions += 1
+        
+        if total_decisions == 0:
+            print("未找到 NewAgent 的策略记录")
+            return
+        
+        print(f"NewAgent 总决策次数: {total_decisions}")
+        for strategy, count in sorted(strategy_counts.items(), key=lambda x: x[1], reverse=True):
+            ratio = count / total_decisions * 100
+            print(f"  {strategy}: {count}次 ({ratio:.2f}%)")
+
+    def _analyze_mistake_strategies(self):
+        """分析NewAgent失误时的策略分布"""
+        print("\n" + "-"*80)
+        print("12. NewAgent 失误策略分析")
+        print("-"*80)
+        
+        mistake_strategies = defaultdict(int)
+        total_mistakes = 0
+        
+        for game in self.games:
+            if not game.shots or not game.winner:
+                continue
+            
+            # 最后一次击球的agent
+            last_shot_player = game.shots[-1][1]
+            last_shot_agent = game.get_agent_for_player(last_shot_player)
+            
+            # 如果最后击球的是NewAgent，且NewAgent输了
+            if last_shot_agent == 'NewAgent' and game.winner != 'NewAgent':
+                # 获取最后一次策略
+                if 'NewAgent' in game.strategies and game.strategies['NewAgent']:
+                    last_strategy = game.strategies['NewAgent'][-1]
+                    mistake_strategies[last_strategy] += 1
+                    total_mistakes += 1
+        
+        if total_mistakes == 0:
+            print("未找到NewAgent的失误记录")
+            return
+        
+        print(f"NewAgent 失误总次数: {total_mistakes}")
+        for strategy, count in sorted(mistake_strategies.items(), key=lambda x: x[1], reverse=True):
+            ratio = count / total_mistakes * 100
+            print(f"  {strategy}: {count}次 ({ratio:.2f}%)")
+
+    def _analyze_strategy_success_rate(self):
+        """分析NewAgent策略成功率（只用连击推理，策略与击球严格一一对应）"""
+        print("\n" + "-"*80)
+        print("13. NewAgent 策略成功率分析")
+        print("-"*80)
+
+        strategy_stats = defaultdict(lambda: {
+            'total': 0,
+            'success': 0,
+            'defense_total': 0,
+            'defense_success': 0,
+            'defense_fail': 0
+        })
+
+        for game in self.games:
+            if 'NewAgent' not in game.strategies:
+                continue
+            # 只统计NewAgent实际击球的索引和策略
+            shot_indices = [idx for idx, shot in enumerate(game.shots) if game.get_agent_for_player(shot[1]) == 'NewAgent']
+            strategies = game.strategies['NewAgent']
+            n = min(len(shot_indices), len(strategies))
+            for j in range(n):
+                i = shot_indices[j]
+                strategy = strategies[j]
+                strategy_stats[strategy]['total'] += 1
+                is_combo = False
+                # 连击推理
+                if i + 1 < len(game.shots):
+                    next_player = game.shots[i + 1][1]
+                    next_agent = game.get_agent_for_player(next_player)
+                    if next_agent == 'NewAgent':
+                        strategy_stats[strategy]['success'] += 1
+                        is_combo = True
+                else:
+                    if game.get_agent_for_player(game.shots[i][1]) == game.winner:
+                        strategy_stats[strategy]['success'] += 1
+                        is_combo = True
+                # Safety防守成功率
+                if strategy == 'Safety':
+                    strategy_stats[strategy]['defense_total'] += 1
+                    if is_combo:
+                        strategy_stats[strategy]['defense_success'] += 1
+                    else:
+                        if i + 1 < len(game.shots):
+                            next_player = game.shots[i + 1][1]
+                            next_agent = game.get_agent_for_player(next_player)
+                            if i + 2 < len(game.shots):
+                                next2_player = game.shots[i + 2][1]
+                                next2_agent = game.get_agent_for_player(next2_player)
+                                if next2_agent == next_agent:
+                                    strategy_stats[strategy]['defense_fail'] += 1
+                                else:
+                                    strategy_stats[strategy]['defense_success'] += 1
+                            else:
+                                if next_agent == game.winner:
+                                    strategy_stats[strategy]['defense_fail'] += 1
+                                else:
+                                    strategy_stats[strategy]['defense_success'] += 1
+
+        if not strategy_stats:
+            print("未找到NewAgent的策略记录")
+            return
+
+        for strategy, stats in sorted(strategy_stats.items(), key=lambda x: x[0]):
+            print(f"\n{strategy}:")
+            total = stats['total']
+            success_rate = stats['success'] / total * 100 if total > 0 else 0
+            print(f"  总次数: {total}")
+            print(f"  击球成功率: {success_rate:.2f}% ({stats['success']}/{total})")
+            if strategy == 'Safety':
+                d_total = stats['defense_total']
+                d_succ = stats['defense_success']
+                d_fail = stats['defense_fail']
+                defense_success_rate = d_succ / d_total * 100 if d_total > 0 else 0
+                defense_fail_rate = d_fail / d_total * 100 if d_total > 0 else 0
+                print(f"  防守成功率: {defense_success_rate:.2f}% ({d_succ}/{d_total})")
+                print(f"  防守失败率: {defense_fail_rate:.2f}% ({d_fail}/{d_total})")
+
     def analyze(self):
         """执行分析"""
         if not self.games:
@@ -134,37 +319,53 @@ class LogAnalyzer:
         # 2. 平均决策时间
         self._analyze_decision_time()
         
-        # 3. 获胜原因分析
+        # 3. 每局平均时间
+        self._analyze_game_duration()
+        
+        # 4. 获胜原因分析
         self._analyze_win_reason()
         
-        # 4. 平均轮次
+        # 5. 平均轮次
         self._analyze_average_rounds()
         
-        # 5. 决策占比
+        # 6. 决策占比
         self._analyze_decision_ratio()
         
-        # 6. 连续击球分析
+        # 7. 连续击球分析
         self._analyze_consecutive_shots()
         
-        # 7. 开局表现
+        # 8. 开局表现
         self._analyze_first_move_advantage()
         
-        # 8. 胜率置信区间
+        # 9. 胜率置信区间
         self._analyze_confidence_interval()
         
-        # 9. 决策时间分布
+        # 10. 决策时间分布
         self._analyze_decision_time_distribution()
-    
+        
+        # 11. NewAgent 策略占比
+        self._analyze_strategy_ratio()
+        
+        # 12. NewAgent 失误策略分析
+        self._analyze_mistake_strategies()
+        
+        # 13. NewAgent 策略成功率分析
+        self._analyze_strategy_success_rate()
+
     def _analyze_win_rate(self):
         """分析胜率"""
         print("\n" + "-"*80)
         print("1. 胜率统计")
         print("-"*80)
         
-        wins = {self.agent_a_name: 0, self.agent_b_name: 0}
+        wins = {self.agent_a_name: 0, self.agent_b_name: 0, "平局": 0}
         for game in self.games:
             if game.winner in wins:
                 wins[game.winner] += 1
+            elif game.winner is None:  # 平局情况
+                wins[self.agent_a_name] += 0.5
+                wins[self.agent_b_name] += 0.5
+                wins["平局"] += 1
         
         total = len(self.games)
         for agent, win_count in wins.items():
@@ -180,15 +381,15 @@ class LogAnalyzer:
         agent_times = {self.agent_a_name: [], self.agent_b_name: []}
         
         for game in self.games:
-            for i in range(1, len(game.shots)):
-                prev_shot = game.shots[i-1]
-                curr_shot = game.shots[i]
+            for i in range(0, len(game.shots)-1):
+                prev_shot = game.shots[i]
+                curr_shot = game.shots[i+1]
                 
                 # 计算决策时间（当前击球时间 - 上一次击球时间）
                 time_diff = (curr_shot[2] - prev_shot[2]).total_seconds()
                 
                 # 获取当前击球的Agent
-                agent = game.get_agent_for_player(curr_shot[1])
+                agent = game.get_agent_for_player(prev_shot[1])
                 if agent in agent_times:
                     agent_times[agent].append(time_diff)
         
@@ -202,12 +403,12 @@ class LogAnalyzer:
     def _analyze_win_reason(self):
         """分析获胜原因"""
         print("\n" + "-"*80)
-        print("3. 获胜原因分析")
+        print("4. 获胜原因分析")
         print("-"*80)
         
         win_reasons = {
-            self.agent_a_name: {'正常打入黑8': 0, '对方失误': 0},
-            self.agent_b_name: {'正常打入黑8': 0, '对方失误': 0}
+            self.agent_a_name: {'正常打入黑8': 0, '对方失误': 0, 'opponent_remaining': []},
+            self.agent_b_name: {'正常打入黑8': 0, '对方失误': 0, 'opponent_remaining': []}
         }
         
         for game in self.games:
@@ -220,6 +421,11 @@ class LogAnalyzer:
             
             if last_shot_agent == game.winner:
                 win_reasons[game.winner]['正常打入黑8'] += 1
+                # 记录对方剩余球数
+                if game.winner == self.agent_a_name and game.agent_b_remaining is not None:
+                    win_reasons[game.winner]['opponent_remaining'].append(game.agent_b_remaining)
+                elif game.winner == self.agent_b_name and game.agent_a_remaining is not None:
+                    win_reasons[game.winner]['opponent_remaining'].append(game.agent_a_remaining)
             else:
                 win_reasons[game.winner]['对方失误'] += 1
         
@@ -231,11 +437,14 @@ class LogAnalyzer:
                 print(f"\n{agent} (共{total_wins}胜):")
                 print(f"  正常打入黑8: {reasons['正常打入黑8']}次 ({normal_rate:.1f}%)")
                 print(f"  对方失误: {reasons['对方失误']}次 ({mistake_rate:.1f}%)")
+                if reasons['opponent_remaining']:
+                    avg_remaining = statistics.mean(reasons['opponent_remaining'])
+                    print(f"  正常打入黑8时对方平均剩余球数: {avg_remaining:.2f}球")
     
     def _analyze_average_rounds(self):
         """分析平均轮次"""
         print("\n" + "-"*80)
-        print("4. 平均轮次统计")
+        print("5. 平均轮次统计")
         print("-"*80)
         
         total_shots = [len(game.shots) for game in self.games if game.shots]
@@ -252,7 +461,7 @@ class LogAnalyzer:
     def _analyze_decision_ratio(self):
         """分析决策占比"""
         print("\n" + "-"*80)
-        print("5. 决策占比分析")
+        print("6. 决策占比分析")
         print("-"*80)
         
         agent_shot_counts = {self.agent_a_name: [], self.agent_b_name: []}
@@ -279,7 +488,7 @@ class LogAnalyzer:
     def _analyze_consecutive_shots(self):
         """分析连续击球"""
         print("\n" + "-"*80)
-        print("6. 连续击球分析")
+        print("7. 连续击球分析")
         print("-"*80)
         
         agent_consecutive = {self.agent_a_name: [], self.agent_b_name: []}
@@ -318,7 +527,7 @@ class LogAnalyzer:
     def _analyze_first_move_advantage(self):
         """分析开局优势"""
         print("\n" + "-"*80)
-        print("7. 开局表现分析")
+        print("8. 开局表现分析")
         print("-"*80)
         
         first_move_wins = {self.agent_a_name: 0, self.agent_b_name: 0}
@@ -346,7 +555,7 @@ class LogAnalyzer:
     def _analyze_confidence_interval(self):
         """分析胜率置信区间（95%置信区间）"""
         print("\n" + "-"*80)
-        print("8. 胜率置信区间 (95%)")
+        print("9. 胜率置信区间 (95%)")
         print("-"*80)
         
         wins = {self.agent_a_name: 0, self.agent_b_name: 0}
@@ -368,17 +577,21 @@ class LogAnalyzer:
     def _analyze_decision_time_distribution(self):
         """分析决策时间分布"""
         print("\n" + "-"*80)
-        print("9. 决策时间分布")
+        print("10. 决策时间分布")
         print("-"*80)
         
         agent_times = {self.agent_a_name: [], self.agent_b_name: []}
         
         for game in self.games:
-            for i in range(1, len(game.shots)):
-                prev_shot = game.shots[i-1]
-                curr_shot = game.shots[i]
+            for i in range(0, len(game.shots)-1):
+                prev_shot = game.shots[i]
+                curr_shot = game.shots[i+1]
+                
+                # 计算决策时间（当前击球时间 - 上一次击球时间）
                 time_diff = (curr_shot[2] - prev_shot[2]).total_seconds()
-                agent = game.get_agent_for_player(curr_shot[1])
+                
+                # 获取当前击球的Agent
+                agent = game.get_agent_for_player(prev_shot[1])
                 if agent in agent_times:
                     agent_times[agent].append(time_diff)
         
@@ -395,10 +608,63 @@ class LogAnalyzer:
                 print(f"  中位数: {median:.2f}秒")
                 print(f"  标准差: {stdev:.2f}秒")
                 print(f"  范围: [{min_time:.2f}秒, {max_time:.2f}秒]")
-
+    
+    def _analyze_game_duration(self):
+        """分析每局平均时间"""
+        print("\n" + "-"*80)
+        print("3. 每局平均时间统计")
+        print("-"*80)
+        
+        # 使用击球时间戳计算的每局时间
+        game_durations_from_shots = []
+        # 使用日志中记录的duration
+        game_durations_from_log = []
+        
+        for game in self.games:
+            # 方法1: 从击球时间戳计算
+            shot_duration = game.get_game_duration()
+            if shot_duration > 0:
+                game_durations_from_shots.append(shot_duration)
+            
+            # 方法2: 从日志中的duration（如果有）
+            if game.duration:
+                game_durations_from_log.append(game.duration)
+        
+        print("\n基于击球时间戳计算:")
+        if game_durations_from_shots:
+            avg_duration = statistics.mean(game_durations_from_shots)
+            median_duration = statistics.median(game_durations_from_shots)
+            min_duration = min(game_durations_from_shots)
+            max_duration = max(game_durations_from_shots)
+            stdev = statistics.stdev(game_durations_from_shots) if len(game_durations_from_shots) > 1 else 0
+            
+            print(f"  平均耗时: {avg_duration:.2f}秒")
+            print(f"  中位数: {median_duration:.2f}秒")
+            print(f"  标准差: {stdev:.2f}秒")
+            print(f"  范围: [{min_duration:.2f}秒, {max_duration:.2f}秒]")
+            print(f"  样本数: {len(game_durations_from_shots)}局")
+        else:
+            print("  无有效数据")
+        
+        print("\n基于日志记录的耗时:")
+        if game_durations_from_log:
+            avg_duration_log = statistics.mean(game_durations_from_log)
+            median_duration_log = statistics.median(game_durations_from_log)
+            min_duration_log = min(game_durations_from_log)
+            max_duration_log = max(game_durations_from_log)
+            stdev_log = statistics.stdev(game_durations_from_log) if len(game_durations_from_log) > 1 else 0
+            
+            print(f"  平均耗时: {avg_duration_log:.2f}秒")
+            print(f"  中位数: {median_duration_log:.2f}秒")
+            print(f"  标准差: {stdev_log:.2f}秒")
+            print(f"  范围: [{min_duration_log:.2f}秒, {max_duration_log:.2f}秒]")
+            print(f"  样本数: {len(game_durations_from_log)}局")
+        else:
+            print("  无有效数据")
 
 def main(log_path):
     """主函数"""
+    
     import sys
     from io import StringIO
     
@@ -448,7 +714,13 @@ def main(log_path):
 
 if __name__ == "__main__":
     # 直接在这里修改要分析的路径
-    log_path = "logs_"  # 可以是文件路径或文件夹路径
+    log_path = "logs_3"  # 可以是文件路径或文件夹路径
     # log_path = "logs/evaluate_20251212_134237.log"  # 单个文件示例
     
-    main(log_path)
+    # main(log_path)
+    # main("logs_5")
+
+    main("logs_basic")
+    main("logs_pro")
+        
+    
