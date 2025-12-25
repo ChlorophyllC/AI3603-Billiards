@@ -23,9 +23,12 @@ from pathlib import Path
 # 导入必要的模块
 from utils import set_random_seed
 from poolenv import PoolEnv
-from agent import BasicAgent, NewAgent
+from agents import BasicAgent, BasicAgentPro, NewAgent
 
 
+def get_remaining_balls(env, player):
+    """计算指定玩家的剩余球数（不含黑8）"""
+    return len([bid for bid in env.player_targets[player] if bid != '8' and env.balls[bid].state.s != 4])
 def setup_logger(log_name='evaluate'):
     """
     设置日志记录器，同时输出到控制台和文件
@@ -38,7 +41,7 @@ def setup_logger(log_name='evaluate'):
         log_file: 日志文件路径
     """
     # 创建 logs 目录
-    log_dir = Path('logs')
+    log_dir = Path('logs_pro')
     log_dir.mkdir(exist_ok=True)
     
     # 生成日志文件名（包含时间戳）
@@ -90,7 +93,7 @@ env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
 n_games = 120  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
-agent_a, agent_b = BasicAgent(), NewAgent()
+agent_a, agent_b = BasicAgentPro(), NewAgent()
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
@@ -118,14 +121,17 @@ for i in range(n_games):
         obs = env.get_observation(player)
         if player == 'A':
             action = players[i % 2].decision(*obs)
+            if isinstance(players[i % 2], NewAgent):
+                strategy = players[i % 2].last_strategy
+                logger.info(f" NewAgent 策略: {strategy}")
         else:
             action = players[(i + 1) % 2].decision(*obs)
+            if isinstance(players[(i + 1) % 2], NewAgent):
+                strategy = players[(i + 1) % 2].last_strategy
+                logger.info(f" NewAgent 策略: {strategy}")
         step_info = env.take_shot(action)
         
         done, info = env.get_done()
-        if not done:
-            if step_info.get('ENEMY_INTO_POCKET'):
-                logger.info(f"对方球入袋：{step_info['ENEMY_INTO_POCKET']}")
         
         if done:
             # 统计结果（player A/B 转换为 agent A/B）
@@ -140,6 +146,18 @@ for i in range(n_games):
                 results[['AGENT_A_WIN', 'AGENT_B_WIN'][(i+1) % 2]] += 1
                 winner_name = ['Agent B', 'Agent A'][i % 2]
                 logger.info(f"第 {i} 局结果: {winner_name} 获胜")
+            
+            # 记录剩余球数
+            a_remaining = get_remaining_balls(env, 'A')
+            b_remaining = get_remaining_balls(env, 'B')
+            # 根据先后手确定 Agent A 和 Agent B 的剩余球数
+            if i % 2 == 0:
+                agent_a_remaining = a_remaining  # Agent A 是 Player A
+                agent_b_remaining = b_remaining  # Agent B 是 Player B
+            else:
+                agent_a_remaining = b_remaining  # Agent A 是 Player B
+                agent_b_remaining = a_remaining  # Agent B 是 Player A
+            logger.info(f"结束时剩余球数 - Agent A: {agent_a_remaining}, Agent B: {agent_b_remaining}")
             
             # 统计时间
             game_elapsed_time = time.time() - game_start_time
