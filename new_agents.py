@@ -774,7 +774,7 @@ class NewAgent(Agent):
                 'a': float(x[3]),
                 'b': float(x[4])
             }
-            trials = 3 if is_black_eight else 2
+            trials = 3
             return -self._evaluate_action(
                 action, trials, balls, my_targets, table, 20, True)
         
@@ -1048,6 +1048,7 @@ class NewAgent(Agent):
         
         try:
             print("[NewAgent] Starting decision process...")
+            shot_type_map = {'direct': 'straight', 'bank': 'bank', 'curve': 'curve'}
             is_opening = self._is_opening_state(balls)
             # 检查是否为开球局面
             if is_opening:
@@ -1100,15 +1101,21 @@ class NewAgent(Agent):
                 else:  # direct
                     base_action = self._geo_shot(cue_pos, target_pos, pocket_pos)
                 
-                geo_score = self._evaluate_action(base_action, 1, balls, my_targets, table, 30, False)
+                geo_score = self._evaluate_action(base_action, 2, balls, my_targets, table, 30, True)
                 if geo_score > -100 or (is_black_eight and geo_score > -300):
                     geo_evaluated.append((base_action, geo_score, choice))
 
             # Sort by geometric score
             geo_evaluated.sort(key=lambda x: x[1], reverse=True)
             print(f"\n[NewAgent] Evaluating top {len(geo_evaluated)} geometric shots, best score: {geo_evaluated[0][1]:.2f}" if geo_evaluated else f"\n[NewAgent] No valid geometric shots found")
-            for i, geo_choice in enumerate(geo_evaluated[:8]):
-                print(f"\r[NewAgent] Processing shot {i+1}/{len(geo_evaluated[:8])}...", end="", flush=True)
+            
+            # Dynamic adjustment based on opponent remaining balls
+            opponent_targets = self._get_opponent_targets(my_targets)
+            opponent_remaining_balls = len([bid for bid in opponent_targets if balls[bid].state.s != 4])
+            num_geo = 5 + (7 - opponent_remaining_balls)
+            
+            for i, geo_choice in enumerate(geo_evaluated[:num_geo]):
+                print(f"\r[NewAgent] Processing shot {i+1}/{len(geo_evaluated[:num_geo])}...", end="", flush=True)
                 base_action, geo_score, choice = geo_choice
                 action_to_check, score_to_check = base_action, geo_score
                 if geo_score > GEO_THRESHOLD:
@@ -1123,6 +1130,7 @@ class NewAgent(Agent):
                         elif fatal_rate <= SAFE_FATAL_THRESHOLD and verified_score >= GEO_THRESHOLD - 10:
                                 print(f"\n[NewAgent] ✓ Found acceptable geometric action: {shot_type_str}: score={verified_score:.2f}, fatal_rate={fatal_rate:.1%}")
                                 self.last_strategy = "Geo"
+                                action_to_check['shot_type'] = shot_type_map[choice['type']]
                                 return action_to_check
 
                 # If geo score is not great, try to optimize
@@ -1134,6 +1142,7 @@ class NewAgent(Agent):
                     if verified_score >= SCORE_THRESHOLD and fatal_rate <= SAFE_FATAL_THRESHOLD:
                         print(f"\n[NewAgent] ✓ Found acceptable optimized action: {shot_type_str}: score={verified_score:.2f}, fatal_rate={fatal_rate:.1%}")
                         self.last_strategy = "Opt"
+                        action_to_check['shot_type'] = shot_type_map[choice['type']]
                         return action_to_check
                     elif verified_score > 0 and fatal_rate <= SAFE_FATAL_THRESHOLD:
                         all_evaluated.append((action_to_check, verified_score, shot_type_str, fatal_rate))
@@ -1151,6 +1160,7 @@ class NewAgent(Agent):
                 if best_score > 30: # Only take the shot if it's reasonably good
                     print(f"[NewAgent] Using best fallback option: {best_type} (score={best_score:.2f})")
                     self.last_strategy = "Fallback"
+                    best_action['shot_type'] = shot_type_map[best_type.split()[0]]
                     return best_action
 
             print("[NewAgent] Final fallback: Switching to defensive strategy...")
