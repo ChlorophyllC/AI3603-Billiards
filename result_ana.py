@@ -5,7 +5,10 @@ from pathlib import Path
 from collections import defaultdict
 import statistics
 import math
-
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei']  # 设置中文字体"]
 
 class GameLog:
     """单局游戏日志"""
@@ -21,6 +24,7 @@ class GameLog:
         self.agent_a_remaining = None
         self.agent_b_remaining = None
         self.strategies = {}  # 策略记录
+        self.shot_types = {}  # shot_type 记录
         
     def get_agent_for_player(self, player):
         """根据Player获取对应的Agent名称"""
@@ -42,10 +46,12 @@ class GameLog:
 class LogAnalyzer:
     """日志分析器"""
     
-    def __init__(self):
+    def __init__(self, log_prefix=None, log_dir=None):
         self.agent_a_name = None
         self.agent_b_name = None
         self.games = []
+        self.log_prefix = log_prefix or ""
+        self.log_dir = log_dir or ""
         
     def parse_log_file(self, file_path):
         """解析单个日志文件"""
@@ -123,6 +129,16 @@ class LogAnalyzer:
                     elif current_game.player_b_agent == 'NewAgent':
                         current_game.strategies.setdefault('NewAgent', []).append(strategy)
 
+            # shot_type 记录
+            if current_game and 'NewAgent shot_type:' in content:
+                match = re.search(r'NewAgent shot_type:\s*(\w+)', content)
+                if match:
+                    shot_type = match.group(1)
+                    if current_game.player_a_agent == 'NewAgent':
+                        current_game.shot_types.setdefault('NewAgent', []).append(shot_type)
+                    elif current_game.player_b_agent == 'NewAgent':
+                        current_game.shot_types.setdefault('NewAgent', []).append(shot_type)
+
             # 进球记录
             if current_game and '本杆进球' in content:
                 match = re.search(r'本杆进球 \((\w+)\) - 我方: (\[.*?\]), 对方: (\[.*?\])', content)
@@ -163,6 +179,126 @@ class LogAnalyzer:
                     self.games.append(current_game)
                     current_game = None
     
+
+    def plot_win_rate(self, win_dict, total, output_path):
+        labels = list(win_dict.keys())
+        values = [win_dict[k] for k in labels]
+        plt.figure(figsize=(6,4))
+        plt.bar(labels, values, color=['#4caf50','#2196f3','#ff9800'])
+        title = f'{self.log_prefix} Win Statistics' if self.log_prefix else 'Win Statistics'
+        plt.title(title)
+        plt.ylabel('Wins')
+        plt.xlabel('Agent')
+        for i, v in enumerate(values):
+            plt.text(i, v+0.05, f'{v} ({v/total*100:.1f}%)', ha='center')
+        plt.tight_layout()
+        fname = f'{self.log_prefix}_win_rate.png' if self.log_prefix else output_path
+        if self.log_dir:
+            fname = os.path.join(self.log_dir, fname)
+        plt.savefig(fname)
+        plt.close()
+
+    def plot_strategy_ratio(self, strategy_counts, total, output_path):
+        labels = list(strategy_counts.keys())
+        values = [strategy_counts[k] for k in labels]
+        plt.figure(figsize=(7,4))
+        plt.bar(labels, values, color=plt.cm.tab20.colors[:len(labels)])
+        title = f'{self.log_prefix} NewAgent Strategy Usage' if self.log_prefix else 'NewAgent Strategy Usage'
+        plt.title(title)
+        plt.ylabel('Count')
+        plt.xlabel('Strategy')
+        for i, v in enumerate(values):
+            plt.text(i, v+0.05, f'{v} ({v/total*100:.1f}%)', ha='center', fontsize=9)
+        plt.tight_layout()
+        fname = f'{self.log_prefix}_strategy_ratio.png' if self.log_prefix else output_path
+        if self.log_dir:
+            fname = os.path.join(self.log_dir, fname)
+        plt.savefig(fname)
+        plt.close()
+
+    def plot_shot_type_ratio(self, shot_type_counts, total, output_path):
+        labels = list(shot_type_counts.keys())
+        values = [shot_type_counts[k] for k in labels]
+        plt.figure(figsize=(7,4))
+        plt.bar(labels, values, color=plt.cm.tab20.colors[:len(labels)])
+        title = f'{self.log_prefix} NewAgent Shot Type Usage' if self.log_prefix else 'NewAgent Shot Type Usage'
+        plt.title(title)
+        plt.ylabel('Count')
+        plt.xlabel('Shot Type')
+        for i, v in enumerate(values):
+            plt.text(i, v+0.05, f'{v} ({v/total*100:.1f}%)', ha='center', fontsize=9)
+        plt.tight_layout()
+        fname = f'{self.log_prefix}_shot_type_ratio.png' if self.log_prefix else output_path
+        if self.log_dir:
+            fname = os.path.join(self.log_dir, fname)
+        plt.savefig(fname)
+        plt.close()
+
+    def plot_strategy_success(self, strategy_stats, output_path):
+        labels = []
+        success_rates = []
+        defense_rates = []
+        for strategy, stats in strategy_stats.items():
+            labels.append(strategy)
+            total = stats['total']
+            srate = stats['success'] / total * 100 if total > 0 else 0
+            success_rates.append(srate)
+            if strategy == 'Safety':
+                d_total = stats['defense_total']
+                d_succ = stats['defense_success']
+                drate = d_succ / d_total * 100 if d_total > 0 else 0
+                defense_rates.append(drate)
+            else:
+                defense_rates.append(None)
+        x = range(len(labels))
+        plt.figure(figsize=(8,4))
+        plt.bar(x, success_rates, width=0.4, label='Shot Success Rate', color='#2196f3')
+        for i, v in enumerate(success_rates):
+            plt.text(i-0.2, v+1, f'{v:.1f}%', fontsize=9)
+        # Only plot Safety defense success rate
+        for i, dr in enumerate(defense_rates):
+            if dr is not None:
+                plt.bar(i+0.4, dr, width=0.4, label='Defense Success Rate' if i==0 else None, color='#ff9800')
+                plt.text(i+0.2, dr+1, f'{dr:.1f}%', fontsize=9, color='#ff9800')
+        plt.xticks(x, labels)
+        plt.ylim(0, 110)
+        plt.ylabel('Success Rate (%)')
+        title = f'{self.log_prefix} Strategy Success Rate' if self.log_prefix else 'Strategy Success Rate'
+        plt.title(title)
+        plt.legend()
+        plt.tight_layout()
+        fname = f'{self.log_prefix}_strategy_success.png' if self.log_prefix else output_path
+        if self.log_dir:
+            fname = os.path.join(self.log_dir, fname)
+        plt.savefig(fname)
+        plt.close()
+
+    def plot_shot_type_success(self, shot_type_stats, output_path):
+        labels = []
+        success_rates = []
+        for shot_type, stats in shot_type_stats.items():
+            labels.append(shot_type)
+            total = stats['total']
+            srate = stats['success'] / total * 100 if total > 0 else 0
+            success_rates.append(srate)
+        x = range(len(labels))
+        plt.figure(figsize=(8,4))
+        plt.bar(x, success_rates, width=0.4, label='Shot Success Rate', color='#2196f3')
+        for i, v in enumerate(success_rates):
+            plt.text(i-0.2, v+1, f'{v:.1f}%', fontsize=9)
+        plt.xticks(x, labels)
+        plt.ylim(0, 110)
+        plt.ylabel('Success Rate (%)')
+        title = f'{self.log_prefix} Shot Type Success Rate' if self.log_prefix else 'Shot Type Success Rate'
+        plt.title(title)
+        plt.legend()
+        plt.tight_layout()
+        fname = f'{self.log_prefix}_shot_type_success.png' if self.log_prefix else output_path
+        if self.log_dir:
+            fname = os.path.join(self.log_dir, fname)
+        plt.savefig(fname)
+        plt.close()
+
     def _analyze_strategy_ratio(self):
         """分析 NewAgent 策略占比"""
         print("\n" + "-"*80)
@@ -187,6 +323,8 @@ class LogAnalyzer:
         for strategy, count in sorted(strategy_counts.items(), key=lambda x: x[1], reverse=True):
             ratio = count / total_decisions * 100
             print(f"  {strategy}: {count}次 ({ratio:.2f}%)")
+        # 可视化
+        self.plot_strategy_ratio(strategy_counts, total_decisions, 'strategy_ratio.png')
 
     def _analyze_mistake_strategies(self):
         """分析NewAgent失误时的策略分布"""
@@ -299,6 +437,83 @@ class LogAnalyzer:
                 defense_fail_rate = d_fail / d_total * 100 if d_total > 0 else 0
                 print(f"  防守成功率: {defense_success_rate:.2f}% ({d_succ}/{d_total})")
                 print(f"  防守失败率: {defense_fail_rate:.2f}% ({d_fail}/{d_total})")
+        # 可视化
+        self.plot_strategy_success(strategy_stats, 'strategy_success.png')
+
+    def _analyze_shot_type_success_rate(self):
+        """分析NewAgent shot_type 成功率（只用连击推理，shot_type 与击球严格一一对应）"""
+        print("\n" + "-"*80)
+        print("15. NewAgent shot_type 成功率分析")
+        print("-"*80)
+
+        shot_type_stats = defaultdict(lambda: {
+            'total': 0,
+            'success': 0
+        })
+
+        for game in self.games:
+            if 'NewAgent' not in game.shot_types:
+                continue
+            # 只统计NewAgent实际击球的索引和shot_type
+            shot_indices = [idx for idx, shot in enumerate(game.shots) if game.get_agent_for_player(shot[1]) == 'NewAgent']
+            shot_types = game.shot_types['NewAgent']
+            n = min(len(shot_indices), len(shot_types))
+            for j in range(n):
+                i = shot_indices[j]
+                shot_type = shot_types[j]
+                if shot_type == 'None':
+                    continue
+                shot_type_stats[shot_type]['total'] += 1
+                # 连击推理
+                if i + 1 < len(game.shots):
+                    next_player = game.shots[i + 1][1]
+                    next_agent = game.get_agent_for_player(next_player)
+                    if next_agent == 'NewAgent':
+                        shot_type_stats[shot_type]['success'] += 1
+                else:
+                    if game.get_agent_for_player(game.shots[i][1]) == game.winner:
+                        shot_type_stats[shot_type]['success'] += 1
+
+        if not shot_type_stats:
+            print("未找到NewAgent的 shot_type 记录")
+            return
+
+        for shot_type, stats in sorted(shot_type_stats.items(), key=lambda x: x[0]):
+            print(f"\n{shot_type}:")
+            total = stats['total']
+            success_rate = stats['success'] / total * 100 if total > 0 else 0
+            print(f"  总次数: {total}")
+            print(f"  击球成功率: {success_rate:.2f}% ({stats['success']}/{total})")
+        # 可视化
+        self.plot_shot_type_success(shot_type_stats, 'shot_type_success.png')
+
+    def _analyze_shot_type_ratio(self):
+        """分析 NewAgent shot_type 占比"""
+        print("\n" + "-"*80)
+        print("14. NewAgent shot_type 占比分析")
+        print("-"*80)
+        
+        shot_type_counts = defaultdict(int)
+        total_shots = 0
+        
+        for game in self.games:
+            for agent, shot_types in game.shot_types.items():
+                if agent == 'NewAgent':
+                    for shot_type in shot_types:
+                        if shot_type != 'None':
+                            shot_type_counts[shot_type] += 1
+                            total_shots += 1
+        
+        if total_shots == 0:
+            print("未找到 NewAgent 的 shot_type 记录")
+            return
+        
+        print(f"NewAgent 总击球次数: {total_shots}")
+        for shot_type, count in sorted(shot_type_counts.items(), key=lambda x: x[1], reverse=True):
+            ratio = count / total_shots * 100
+            print(f"  {shot_type}: {count}次 ({ratio:.2f}%)")
+        # 可视化
+        self.plot_shot_type_ratio(shot_type_counts, total_shots, 'shot_type_ratio.png')
 
     def analyze(self):
         """执行分析"""
@@ -352,6 +567,12 @@ class LogAnalyzer:
         # 13. NewAgent 策略成功率分析
         self._analyze_strategy_success_rate()
 
+        # 14. NewAgent shot_type 占比
+        self._analyze_shot_type_ratio()
+
+        # 15. NewAgent shot_type 成功率分析
+        self._analyze_shot_type_success_rate()
+
     def _analyze_win_rate(self):
         """分析胜率"""
         print("\n" + "-"*80)
@@ -371,6 +592,8 @@ class LogAnalyzer:
         for agent, win_count in wins.items():
             win_rate = win_count / total * 100
             print(f"{agent}: {win_count}胜 / {total}局 = {win_rate:.2f}%")
+        # 可视化
+        self.plot_win_rate(wins, total, 'win_rate.png')
     
     def _analyze_decision_time(self):
         """分析平均决策时间"""
@@ -668,7 +891,14 @@ def main(log_path):
     import sys
     from io import StringIO
     
-    analyzer = LogAnalyzer()
+    # 提取log前缀
+    if os.path.isdir(log_path):
+        log_prefix = os.path.basename(os.path.normpath(log_path))
+        log_dir = log_path
+    else:
+        log_prefix = os.path.splitext(os.path.basename(log_path))[0]
+        log_dir = os.path.dirname(os.path.abspath(log_path))
+    analyzer = LogAnalyzer(log_prefix=log_prefix, log_dir=log_dir)
     
     if os.path.isfile(log_path):
         print(f"正在分析文件: {log_path}")
